@@ -6,8 +6,12 @@ MAX messenger (max.ru) channel plugin for [OpenClaw](https://github.com/openclaw
 
 - DM and group chat support
 - Long polling (default) and webhook modes
-- Streaming replies with typing indicator
-- Media sending and receiving (images)
+- Live status updates (Telegram-style): a placeholder reply that shows work in
+  progress — thinking, per-tool activity, approval waits — and is cleaned up on
+  silent replies
+- Forwarded messages: incoming forwards are unwrapped and passed to the agent
+- Media sending and receiving (images), including screenshots and images from
+  forwarded messages, saved to `~/.openclaw/media/inbound`
 - Allowlist-based access control
 
 ## Installation
@@ -105,6 +109,16 @@ mandates.
 
 If your gateway has no direct route to `platform-api2.max.ru`, set `httpProxy` to
 tunnel all MAX traffic through a proxy.
+
+## OpenClaw 2026.8+ compatibility
+
+Since **v0.6.0** the plugin runs on OpenClaw 2026.8+ cores: it no longer calls the
+renamed `config.loadConfig` and derives session keys through the core route
+resolver (canonical keys) instead of a flat `max:<senderId>`.
+
+> **Upgrade note:** the session-key change means active MAX dialogs are re-keyed
+> once on the first restart after upgrading — ongoing conversations start a fresh
+> session history that one time. This is expected, not a bug.
 
 ## Webhook mode (optional)
 
