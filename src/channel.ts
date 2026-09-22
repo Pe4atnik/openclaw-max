@@ -34,6 +34,15 @@ const CHANNEL_ID = "max";
 const activeTypingStops = new Map<string, () => void>();
 let typingStopSeq = 0;
 
+/**
+ * Схема настроек канала.
+ *
+ * ⚠️ Приведение типа обязательно. Ядро держит свою копию zod (сейчас 4.5.4), а
+ * плагин — свою; когда npm ставит их рядом, структурно одинаковые схемы
+ * оказываются РАЗНЫМИ типами, и `tsc` спорит о внутренностях `$ZodCheck`
+ * вплоть до `Type '5' is not assignable to type '6'`. Локально этого не видно:
+ * там обе копии схлопываются в одну. Поймала проверка на двух версиях ядра.
+ */
 const MaxConfigSchema = buildChannelConfigSchema(
   z.object({
     token: z.string().optional().describe("MAX Bot API token (from business.max.ru)"),
@@ -42,7 +51,7 @@ const MaxConfigSchema = buildChannelConfigSchema(
     allowFrom: z.array(z.string()).optional().describe("Allowed MAX user IDs (when dmPolicy=allowlist)"),
     webhookUrl: z.string().optional().describe("Webhook URL for production mode (optional, uses long polling if not set)"),
     webhookSecret: z.string().optional().describe("Webhook secret for verifying MAX requests"),
-  }).passthrough()
+  }).passthrough() as unknown as Parameters<typeof buildChannelConfigSchema>[0]
 );
 
 // Track active webhook route unregisters per account
