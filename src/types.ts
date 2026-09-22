@@ -3,6 +3,33 @@
  * https://dev.max.ru/docs-api
  */
 
+// ─── Inbound delivery ─────────────────────────────────────────────────────────
+
+/** One inbound image, already downloaded and base64-encoded for the agent. */
+export interface InboundImage {
+  data: string;
+  mimeType: string;
+}
+
+/**
+ * What the webhook/polling handler hands to the channel for one inbound message.
+ *
+ * `webhook-handler.ts` is a compiled copy carrying `@ts-nocheck`, so the shape is
+ * declared here instead: `channel.ts` imported `InboundImage` from that module,
+ * which never exported it, and the build reported the error on every run.
+ */
+export interface InboundDelivery {
+  text: string;
+  senderId: string;
+  senderName: string;
+  chatId: string;
+  dialogChatId: string;
+  chatType: string;
+  messageId: string;
+  accountId: string;
+  images?: InboundImage[];
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 export interface MaxAccountConfig {
