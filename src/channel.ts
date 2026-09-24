@@ -14,8 +14,10 @@ import {
   setAccountEnabledInConfigSection,
 } from "openclaw/plugin-sdk/core";
 import { registerPluginHttpRoute } from "openclaw/plugin-sdk/webhook-ingress";
+import { buildOptionalSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
 import { z } from "zod";
-import { listAccountIds, resolveAccount } from "./accounts.js";
+import { describeMissingToken, listAccountIds, resolveAccount } from "./accounts.js";
+import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, markSeen, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile, configureMaxTransport, createUpload, uploadToUrl, sendWithAttachment } from "./client.js";
 import type { MaxSendTarget } from "./client.js";
 import { resolveChannelPreviewStreamMode } from "openclaw/plugin-sdk/channel-outbound";
@@ -45,7 +47,9 @@ let typingStopSeq = 0;
  */
 const MaxConfigSchema = buildChannelConfigSchema(
   z.object({
-    token: z.string().optional().describe("MAX Bot API token (from business.max.ru)"),
+    // Строка или SecretRef `{ source, provider, id }`: ссылку разрешает ядро
+    // (см. `secret-contract.ts`), до плагина доходит уже строка.
+    token: buildOptionalSecretInputSchema().describe("MAX Bot API token (from business.max.ru), plain or SecretRef"),
     enabled: z.boolean().optional().default(true).describe("Enable or disable this channel"),
     dmPolicy: z.enum(["open", "allowlist", "closed"]).optional().default("allowlist").describe("Who can send DMs"),
     allowFrom: z.array(z.string()).optional().describe("Allowed MAX user IDs (when dmPolicy=allowlist)"),
@@ -725,6 +729,11 @@ export function createMaxPlugin(): any {
 
     configSchema: MaxConfigSchema,
 
+    secrets: {
+      secretTargetRegistryEntries,
+      collectRuntimeConfigAssignments,
+    },
+
     config: {
       listAccountIds: (cfg: any) => listAccountIds(cfg),
       resolveAccount: (cfg: any, accountId?: string | null) => resolveAccount(cfg, accountId),
@@ -788,7 +797,7 @@ export function createMaxPlugin(): any {
 
       sendText: async ({ to, text, accountId, cfg }: any) => {
         const account = resolveAccount(cfg ?? {}, accountId);
-        if (!account.token) throw new Error("MAX token not configured");
+        if (!account.token) throw new Error(describeMissingToken(account));
 
         const numericId = parseInt(to.replace(/^max:(?:user:)?/i, ""), 10);
         if (isNaN(numericId)) throw new Error(`Invalid MAX user ID: ${to}`);
@@ -800,7 +809,7 @@ export function createMaxPlugin(): any {
 
       sendMedia: async ({ to, buffer, mimeType, filename, caption, accountId, cfg, chatType }: any) => {
         const account = resolveAccount(cfg ?? {}, accountId);
-        if (!account.token) throw new Error("MAX token not configured");
+        if (!account.token) throw new Error(describeMissingToken(account));
 
         const numericId = parseInt(to.replace(/^max:(?:user:)?/i, ""), 10);
         if (isNaN(numericId)) throw new Error(`Invalid MAX user ID: ${to}`);
@@ -866,6 +875,11 @@ export function createMaxPlugin(): any {
 
         if (!account.enabled) {
           log?.info?.(`[openclaw-max] Account ${accountId} disabled, skipping`);
+          return waitUntilAbort(ctx.abortSignal);
+        }
+
+        if (account.tokenUnresolved) {
+          log?.error?.(`[openclaw-max] Account ${accountId}: ${describeMissingToken(account)}, not starting`);
           return waitUntilAbort(ctx.abortSignal);
         }
 

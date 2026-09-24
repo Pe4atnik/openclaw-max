@@ -32,10 +32,20 @@ export interface InboundDelivery {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
+/** Reference to a secret the host resolves before the plugin reads the config. */
+export interface MaxSecretRef {
+  source: string;
+  provider?: string;
+  id?: string;
+}
+
+/** Plain token or a SecretRef to it. */
+export type MaxTokenInput = string | MaxSecretRef;
+
 export interface MaxAccountConfig {
   enabled?: boolean;
-  /** Bot token from MAX Partner Platform */
-  token?: string;
+  /** Bot token from MAX Partner Platform, or a SecretRef to it */
+  token?: MaxTokenInput;
   /**
    * Public HTTPS URL for webhook delivery (e.g. https://yourdomain.com/max/webhook).
    * If omitted, the plugin falls back to long polling.
@@ -62,7 +72,10 @@ export interface MaxConfig extends MaxAccountConfig {
 
 export interface ResolvedMaxAccount {
   accountId: string;
+  /** Empty when the token is missing or its SecretRef was not resolved. */
   token: string;
+  /** `source:provider:id` of a SecretRef the host left unresolved. */
+  tokenUnresolved?: string;
   enabled: boolean;
   webhookUrl?: string;
   webhookSecret?: string;

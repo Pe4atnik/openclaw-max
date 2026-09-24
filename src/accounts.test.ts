@@ -1,6 +1,12 @@
 /** Разбор настроек учётных записей канала и доступ к рантайму ядра. */
 import { beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_ACCOUNT_ID, DEFAULT_WEBHOOK_PATH, listAccountIds, resolveAccount } from "./accounts.js";
+import {
+  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBHOOK_PATH,
+  describeMissingToken,
+  listAccountIds,
+  resolveAccount,
+} from "./accounts.js";
 import { getMaxRuntime, setMaxRuntime } from "./runtime.js";
 
 describe("listAccountIds", () => {
@@ -90,6 +96,47 @@ describe("resolveAccount", () => {
 
   it("пустой прокси считается отсутствующим", () => {
     expect(resolveAccount({ channels: { max: { httpProxy: "   " } } }).httpProxy).toBeUndefined();
+  });
+});
+
+describe("токен-ссылка (SecretRef)", () => {
+  const ref = { source: "exec", provider: "openclaw-keychain", id: "max-bot-token" };
+
+  it("неразрешённая ссылка не роняет разбор: токен пуст, причина названа", () => {
+    const account = resolveAccount({ channels: { max: { token: ref } } });
+    expect(account.token).toBe("");
+    expect(account.tokenUnresolved).toBe("exec:openclaw-keychain:max-bot-token");
+    expect(describeMissingToken(account)).toContain("SecretRef exec:openclaw-keychain:max-bot-token is not resolved");
+  });
+
+  it("учётка со ссылкой остаётся в списке — ядро покажет её недоступной, а не потеряет", () => {
+    expect(listAccountIds({ channels: { max: { token: ref } } })).toEqual(["default"]);
+  });
+
+  it("ссылка в отдельной учётке перекрывает корневую строку", () => {
+    const account = resolveAccount(
+      { channels: { max: { token: "root", accounts: { work: { token: ref } } } } },
+      "work",
+    );
+    expect(account.tokenUnresolved).toBe("exec:openclaw-keychain:max-bot-token");
+  });
+
+  it("разрешённая ядром ссылка приходит строкой и обрезается как обычно", () => {
+    const account = resolveAccount({ channels: { max: { token: "  resolved  " } } });
+    expect(account).toMatchObject({ token: "resolved" });
+    expect(account.tokenUnresolved).toBeUndefined();
+  });
+
+  it("ссылка без provider и id и вовсе не строка тоже не роняют разбор", () => {
+    const partial = resolveAccount({ channels: { max: { token: { source: "env" } } } } as never);
+    expect(partial.tokenUnresolved).toBe("env:?:?");
+    const odd = resolveAccount({ channels: { max: { token: 42 } } } as never);
+    expect(odd).toMatchObject({ token: "", tokenUnresolved: "value is not a string" });
+    expect(resolveAccount({ channels: { max: { token: null } } } as never).tokenUnresolved).toBeUndefined();
+  });
+
+  it("без ссылки причина прежняя", () => {
+    expect(describeMissingToken(resolveAccount({}))).toBe("MAX token not configured");
   });
 });
 

@@ -33,6 +33,18 @@ vi.mock("openclaw/plugin-sdk/webhook-ingress", () => ({
 const setAccountEnabledInConfigSection = vi.fn((args: Record<string, unknown>) => ({
   marked: args.accountId,
 }));
+// Новые подпути SDK, которые тянет channel.ts: без них набор падает в CI, где ядра нет.
+vi.mock("openclaw/plugin-sdk/secret-input", async () => {
+  const { z } = await import("zod");
+  return {
+    buildOptionalSecretInputSchema: () =>
+      z.union([z.string(), z.object({ source: z.string(), provider: z.string(), id: z.string() })]).optional(),
+  };
+});
+vi.mock("./secret-contract.js", () => ({
+  secretTargetRegistryEntries: [],
+  collectRuntimeConfigAssignments: () => {},
+}));
 vi.mock("openclaw/plugin-sdk/core", () => ({
   buildChannelConfigSchema: (shape: unknown) => shape,
   DEFAULT_ACCOUNT_ID: "default",
@@ -94,6 +106,13 @@ afterEach(() => {
 });
 
 describe("описание канала", () => {
+  it("отдаёт ядру контракт секретов: реестр путей и сборщик назначений", () => {
+    expect(plugin.secrets).toEqual({
+      secretTargetRegistryEntries: expect.any(Array),
+      collectRuntimeConfigAssignments: expect.any(Function),
+    });
+  });
+
   it("объявляет себя каналом MAX с поддержкой медиа", () => {
     expect(plugin.id).toBe("max");
     expect(plugin.capabilities.media).toBe(true);
@@ -338,6 +357,30 @@ describe("запуск канала", () => {
     await missing;
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("missing token"));
     expect(client.getBotInfo).not.toHaveBeenCalled();
+  });
+
+  it("неразрешённая ссылка на токен: внятная ошибка, в API не ходим", async () => {
+    const ref = { source: "exec", provider: "openclaw-keychain", id: "max-bot-token" };
+    const ctl = abortable();
+    const started = plugin.gateway.startAccount({
+      cfg: { channels: { max: { token: ref } } },
+      accountId: "default",
+      log,
+      abortSignal: ctl.signal,
+    });
+    ctl.abort();
+    await started;
+
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("SecretRef exec:openclaw-keychain:max-bot-token is not resolved"));
+    expect(client.getBotInfo).not.toHaveBeenCalled();
+    expect(client.configureMaxTransport).not.toHaveBeenCalled();
+
+    const refCfg = { channels: { max: { token: ref } } };
+    await expect(plugin.outbound.sendText({ to: "42", text: "x", cfg: refCfg })).rejects.toThrow("is not resolved");
+    await expect(
+      plugin.outbound.sendMedia({ to: "42", buffer: Buffer.from("x"), mimeType: "image/png", cfg: refCfg }),
+    ).rejects.toThrow("is not resolved");
+    expect(client.sendDm).not.toHaveBeenCalled();
   });
 
   it("неверный токен останавливает запуск после проверки", async () => {

@@ -30,6 +30,18 @@ const registerPluginHttpRoute = vi.fn((..._args: unknown[]) => unregisterRoute);
 vi.mock("openclaw/plugin-sdk/webhook-ingress", () => ({
   registerPluginHttpRoute: (...args: unknown[]) => registerPluginHttpRoute(...args),
 }));
+// Новые подпути SDK, которые тянет channel.ts: без них набор падает в CI, где ядра нет.
+vi.mock("openclaw/plugin-sdk/secret-input", async () => {
+  const { z } = await import("zod");
+  return {
+    buildOptionalSecretInputSchema: () =>
+      z.union([z.string(), z.object({ source: z.string(), provider: z.string(), id: z.string() })]).optional(),
+  };
+});
+vi.mock("./secret-contract.js", () => ({
+  secretTargetRegistryEntries: [],
+  collectRuntimeConfigAssignments: () => {},
+}));
 vi.mock("openclaw/plugin-sdk/core", () => ({
   buildChannelConfigSchema: (shape: unknown) => shape,
   DEFAULT_ACCOUNT_ID: "default",
