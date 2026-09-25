@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import { isRetryableError, retryWithBackoff, runResilientPolling } from "../src/reconnect.ts";
+import { test } from "vitest";
+import { isRetryableError, retryWithBackoff, runResilientPolling } from "./reconnect.js";
 
 class StatusError extends Error {
   readonly status: number;

@@ -23,10 +23,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src index.ts secret-contract-api.ts",
     "test": "vitest run",
-    "test:reconnect": "node --test --experimental-strip-types test/reconnect.test.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "check": "npm run typecheck && npm run check:sdk-imports && npm run test:coverage && npm run test:reconnect && npm run check:test-isolation && npm run build && npm run check:pack",
+    "check": "npm run typecheck && npm run check:sdk-imports && npm run test:coverage && npm run check:test-isolation && npm run build && npm run check:pack",
     "check:pack": "npm pack --dry-run",
     "check:sdk-imports": "node scripts/check-sdk-imports.mjs",
     "check:test-isolation": "node scripts/check-test-isolation.mjs"
