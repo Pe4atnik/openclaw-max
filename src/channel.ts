@@ -238,14 +238,21 @@ function safeFileName(raw: string): string {
 }
 
 /** Прочитать вложение: локальный файл или ссылка. */
-async function readOutboundMedia(ref: string): Promise<Buffer> {
+async function readOutboundMedia(
+  ref: string,
+  mediaReadFile?: (filePath: string) => Promise<Buffer>,
+): Promise<Buffer> {
   if (/^https?:\/\//i.test(ref)) {
     const res = await fetch(ref);
     if (!res.ok) throw new Error(`media fetch failed: ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   }
+  const localPath = ref.startsWith("file://")
+    ? (await import("node:url")).fileURLToPath(ref)
+    : ref;
+  if (mediaReadFile) return Buffer.from(await mediaReadFile(localPath));
   const { readFile } = await import("node:fs/promises");
-  return readFile(ref.startsWith("file://") ? new URL(ref) : ref);
+  return readFile(localPath);
 }
 
 export function createStreamingDeliver(
@@ -835,17 +842,42 @@ export function createMaxPlugin(): any {
         return { channel: CHANNEL_ID, messageId: `max-${Date.now()}`, chatId: to };
       },
 
-      sendMedia: async ({ to, buffer, mimeType, filename, caption, accountId, cfg, chatType }: any) => {
+      sendMedia: async ({
+        to,
+        buffer,
+        mediaUrl,
+        mediaReadFile,
+        mimeType,
+        filename,
+        caption,
+        text: outboundText,
+        accountId,
+        cfg,
+        chatType,
+      }: any) => {
         const account = resolveAccount(cfg ?? {}, accountId);
         if (!account.token) throw new Error(describeMissingToken(account));
 
         const numericId = parseInt(to.replace(/^max:(?:user:)?/i, ""), 10);
         if (isNaN(numericId)) throw new Error(`Invalid MAX user ID: ${to}`);
 
-        // Determine media type
-        const mediaType = inferOutboundMediaType(mimeType, filename, buffer);
+        // Current OpenClaw gives outbound adapters `mediaUrl`; older bridges
+        // and focused tests may provide an already prepared `buffer`.
+        const mediaBuffer = Buffer.isBuffer(buffer)
+          ? buffer
+          : typeof mediaUrl === "string" && mediaUrl
+            ? await readOutboundMedia(mediaUrl, mediaReadFile)
+            : null;
+        if (!mediaBuffer) throw new Error("MAX media payload is missing");
 
-        const text = caption ?? "";
+        const inferredFilename = filename ?? (typeof mediaUrl === "string"
+          ? safeFileName(mediaUrl.split(/[?#]/, 1)[0]?.split("/").pop() || "file")
+          : "file");
+
+        // Determine media type
+        const mediaType = inferOutboundMediaType(mimeType, inferredFilename, mediaBuffer);
+
+        const text = caption ?? outboundText ?? "";
         let mid: string | null = null;
         if (mediaType === "image") {
           // Для картинки токен вложения отдаёт сам загрузчик.
@@ -853,9 +885,9 @@ export function createMaxPlugin(): any {
           if (!uploadUrl) throw new Error("Failed to get MAX upload URL");
           const uploaded = await uploadFile(
             uploadUrl,
-            buffer,
+            mediaBuffer,
             mimeType ?? "application/octet-stream",
-            filename ?? "file",
+            inferredFilename,
           );
           if (!uploaded) throw new Error("Failed to upload file to MAX");
           if (chatType === "direct" || !chatType) {
@@ -872,9 +904,9 @@ export function createMaxPlugin(): any {
           if (!upload) throw new Error("Failed to create MAX upload");
           const stored = await uploadToUrl(
             upload.url,
-            buffer,
+            mediaBuffer,
             mimeType ?? "application/octet-stream",
-            filename ?? "file",
+            inferredFilename,
           );
           if (!stored) throw new Error("Failed to upload file to MAX");
           mid = await sendWithAttachment(
