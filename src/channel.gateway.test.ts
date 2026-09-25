@@ -276,6 +276,33 @@ describe("длинный опрос", () => {
     await started;
   });
 
+  it("ошибка одного update не повторяет пачку и не мешает следующему", async () => {
+    const ctl = new AbortController();
+    const broken = { update_type: "message_created", message: { body: { mid: "broken" } } };
+    const healthy = { update_type: "message_created", message: { body: { mid: "healthy" } } };
+    client.getUpdates
+      .mockResolvedValueOnce({ updates: [broken, healthy], marker: 4 })
+      .mockImplementationOnce(async (_token: string, marker: number | null | undefined) => {
+        expect(marker).toBe(4);
+        ctl.abort();
+        return { updates: [], marker: 4 };
+      });
+    handleUpdate
+      .mockRejectedValueOnce(new TypeError("handler bug"))
+      .mockResolvedValueOnce(undefined);
+
+    await plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+
+    expect(client.getUpdates).toHaveBeenCalledTimes(2);
+    expect(handleUpdate).toHaveBeenCalledTimes(2);
+    expect(handleUpdate.mock.calls[0]?.[0]).toBe(broken);
+    expect(handleUpdate.mock.calls[1]?.[0]).toBe(healthy);
+    expect(log.error).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to process MAX update; skipping it: TypeError: handler bug"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("MAX connection lost"));
+  });
+
   it("ошибка опроса считается и ход повторяется после паузы", async () => {
     vi.useFakeTimers();
     const ctl = new AbortController();

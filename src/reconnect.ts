@@ -100,15 +100,9 @@ export async function runResilientPolling<T>(options: PollingOptions<T>): Promis
   const sleep = options.sleep ?? abortableSleep;
 
   while (!options.signal?.aborted) {
+    let result: T;
     try {
-      const result = await options.poll();
-      if (options.signal?.aborted) break;
-      await options.onResult(result);
-      consecutiveErrors = 0;
-      if (disconnected) {
-        disconnected = false;
-        options.onConnectionRestored?.();
-      }
+      result = await options.poll();
     } catch (error) {
       if (options.signal?.aborted) break;
       if (!options.isRetryable(error)) throw error;
@@ -125,7 +119,20 @@ export async function runResilientPolling<T>(options: PollingOptions<T>): Promis
       );
       options.onRetry?.(error, consecutiveErrors, delayMs);
       await sleep(delayMs, options.signal);
+      continue;
     }
+
+    if (options.signal?.aborted) break;
+    consecutiveErrors = 0;
+    if (disconnected) {
+      disconnected = false;
+      options.onConnectionRestored?.();
+    }
+
+    // Processing failures are not transport failures. Never retry a completed
+    // poll here: replaying the same marker can duplicate updates already handled
+    // from that batch. Callers decide how to isolate individual result errors.
+    await options.onResult(result);
   }
 }
 

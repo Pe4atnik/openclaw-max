@@ -65,6 +65,20 @@ test("long polling recovers after more than five failures", async () => {
   assert.equal(restored, 1);
 });
 
+test("result processing failures are not retried as transport failures", async () => {
+  let polls = 0;
+  let retries = 0;
+  await assert.rejects(runResilientPolling({
+    poll: async () => { polls += 1; return "batch"; },
+    onResult: async () => { throw new TypeError("handler bug"); },
+    isRetryable: isRetryableError,
+    sleep: immediate,
+    onRetry: () => { retries += 1; },
+  }), /handler bug/);
+  assert.equal(polls, 1);
+  assert.equal(retries, 0);
+});
+
 test("a successful poll resets consecutive error backoff", async () => {
   const controller = new AbortController();
   const delays: number[] = [];

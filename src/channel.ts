@@ -1025,15 +1025,20 @@ async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg:
         log?.info?.(`[openclaw-max] Received ${result.updates.length} update(s)`);
         const currentCfg = _cfg;
         for (const update of result.updates) {
-          await handleUpdate(
-            update,
-            account,
-            async (msg: InboundDelivery) => {
-              await deliverMessage(msg, account, currentCfg, log);
-              return null;
-            },
-            log,
-          );
+          try {
+            await handleUpdate(
+              update,
+              account,
+              async (msg: InboundDelivery) => {
+                await deliverMessage(msg, account, currentCfg, log);
+                return null;
+              },
+              log,
+            );
+          } catch (error) {
+            const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+            log?.error?.(`[openclaw-max] Failed to process MAX update; skipping it: ${detail}`);
+          }
         }
       }
       if (result.marker != null) marker = result.marker;
