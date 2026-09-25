@@ -28,17 +28,8 @@ import {
 } from "./progress-draft.js";
 import { getMaxRuntime } from "./runtime.js";
 import { createWebhookHandler, handleUpdate } from "./webhook-handler.js";
-<<<<<<< HEAD
-import type { ResolvedMaxAccount } from "./types.js";
-import { isAbortError, isRetryableError, retryWithBackoff, runResilientPolling } from "./reconnect.js";
-
-interface InboundImage {
-  data: string;
-  mimeType: string;
-}
-=======
 import type { InboundDelivery, InboundImage, ResolvedMaxAccount } from "./types.js";
->>>>>>> refs/remotes/shagrat2/feat/media-and-progress
+import { isAbortError, isRetryableError, retryWithBackoff, runResilientPolling } from "./reconnect.js";
 
 const CHANNEL_ID = "max";
 
@@ -978,11 +969,7 @@ async function startWebhookMode(ctx: any, account: ResolvedMaxAccount, _cfg: unk
 
   const handler = createWebhookHandler({
     account,
-<<<<<<< HEAD
-    deliver: async (msg: Parameters<typeof deliverMessage>[0]) => {
-=======
     deliver: async (msg: InboundDelivery) => {
->>>>>>> refs/remotes/shagrat2/feat/media-and-progress
       const currentCfg = _cfg;
       await deliverMessage(msg, account, currentCfg, log);
       return null;
@@ -1041,11 +1028,7 @@ async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg:
           await handleUpdate(
             update,
             account,
-<<<<<<< HEAD
-            async (msg: Parameters<typeof deliverMessage>[0]) => {
-=======
             async (msg: InboundDelivery) => {
->>>>>>> refs/remotes/shagrat2/feat/media-and-progress
               await deliverMessage(msg, account, currentCfg, log);
               return null;
             },
