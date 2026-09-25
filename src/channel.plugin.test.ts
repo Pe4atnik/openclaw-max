@@ -393,7 +393,6 @@ describe("запуск канала", () => {
       log,
       abortSignal: ctl.signal,
     });
-    ctl.abort();
     await started;
 
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining("Token verification failed"));
@@ -460,12 +459,17 @@ describe("запуск канала", () => {
   it("без webhookUrl идёт длинный опрос и обновления уходят обработчику", async () => {
     client.getBotInfo.mockResolvedValueOnce({ name: "бот", username: "bot" });
     const ctl = abortable();
-    client.getUpdates.mockImplementation(async () => {
-      ctl.abort();
-      return { updates: [{ update_type: "message_created" }], marker: 11 };
-    });
+    client.getUpdates
+      .mockResolvedValueOnce({ updates: [{ update_type: "message_created" }], marker: 11 })
+      .mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => ctl.signal.addEventListener("abort", () => resolve(), { once: true }));
+        return { updates: [], marker: 11 };
+      });
 
-    await plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.waitFor(() => expect(handleUpdate).toHaveBeenCalledOnce());
+    ctl.abort();
+    await started;
 
     expect(client.getUpdates).toHaveBeenCalled();
     expect(handleUpdate).toHaveBeenCalledWith(
