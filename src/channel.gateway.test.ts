@@ -276,31 +276,67 @@ describe("длинный опрос", () => {
     await started;
   });
 
-  it("ошибка одного update не повторяет пачку и не мешает следующему", async () => {
+  it("повторяет сбойный update до успеха, сохраняет порядок и только потом двигает marker", async () => {
+    vi.useFakeTimers();
     const ctl = new AbortController();
-    const broken = { update_type: "message_created", message: { body: { mid: "broken" } } };
-    const healthy = { update_type: "message_created", message: { body: { mid: "healthy" } } };
+    const first = { update_type: "message_created", message: { body: { mid: "first" } } };
+    const second = { update_type: "message_created", message: { body: { mid: "second" } } };
     client.getUpdates
-      .mockResolvedValueOnce({ updates: [broken, healthy], marker: 4 })
+      .mockResolvedValueOnce({ updates: [first, second], marker: 4 })
       .mockImplementationOnce(async (_token: string, marker: number | null | undefined) => {
         expect(marker).toBe(4);
         ctl.abort();
         return { updates: [], marker: 4 };
       });
     handleUpdate
-      .mockRejectedValueOnce(new TypeError("handler bug"))
-      .mockResolvedValueOnce(undefined);
+      .mockRejectedValueOnce(new TypeError("transient handler bug"))
+      .mockResolvedValue(undefined);
 
-    await plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await started;
 
-    expect(client.getUpdates).toHaveBeenCalledTimes(2);
-    expect(handleUpdate).toHaveBeenCalledTimes(2);
-    expect(handleUpdate.mock.calls[0]?.[0]).toBe(broken);
-    expect(handleUpdate.mock.calls[1]?.[0]).toBe(healthy);
-    expect(log.error).toHaveBeenCalledWith(
-      expect.stringContaining("Failed to process MAX update; skipping it: TypeError: handler bug"),
-    );
+    expect(handleUpdate.mock.calls.map((call) => call[0])).toEqual([first, first, second]);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("MAX update processing failed; retry 1/2"));
     expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("MAX connection lost"));
+  });
+
+  it("не двигает marker и не обгоняет update после исчерпания попыток", async () => {
+    vi.useFakeTimers();
+    const ctl = new AbortController();
+    const first = { update_type: "message_created", message: { body: { mid: "first" } } };
+    const second = { update_type: "message_created", message: { body: { mid: "second" } } };
+    client.getUpdates.mockResolvedValueOnce({ updates: [first, second], marker: 7 });
+    handleUpdate.mockRejectedValue(new TypeError("persistent handler bug"));
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    const rejected = expect(started).rejects.toThrow("persistent handler bug");
+    await vi.advanceTimersByTimeAsync(2_000);
+    await rejected;
+
+    expect(handleUpdate).toHaveBeenCalledTimes(3);
+    expect(handleUpdate.mock.calls.every((call) => call[0] === first)).toBe(true);
+    expect(client.getUpdates).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("marker not advanced"));
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("MAX connection lost"));
+  });
+
+  it("abort останавливает retry update без marker advance", async () => {
+    vi.useFakeTimers();
+    const ctl = new AbortController();
+    const update = { update_type: "message_created", message: { body: { mid: "abort" } } };
+    client.getUpdates.mockResolvedValueOnce({ updates: [update], marker: 9 });
+    handleUpdate.mockRejectedValue(new TypeError("handler bug"));
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.waitFor(() => expect(handleUpdate).toHaveBeenCalledOnce());
+    ctl.abort();
+    await vi.runAllTimersAsync();
+    await started;
+
+    expect(handleUpdate).toHaveBeenCalledTimes(1);
+    expect(client.getUpdates).toHaveBeenCalledTimes(1);
+    expect(log.error).not.toHaveBeenCalledWith(expect.stringContaining("marker not advanced"));
   });
 
   it("ошибка опроса считается и ход повторяется после паузы", async () => {

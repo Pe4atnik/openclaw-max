@@ -4,7 +4,7 @@
  * Отправка вложений вынесена в `client.attachments.test.ts` — там своя история
  * с токеном и ожиданием готовности.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const fetchMock = vi.fn();
 const agentCalls: unknown[] = [];
@@ -42,6 +42,10 @@ beforeEach(() => {
   proxyCalls.length = 0;
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe("configureMaxTransport", () => {
   it("без прокси берёт обычный агент, доверяющий CA Минцифры", () => {
     client.configureMaxTransport({});
@@ -59,6 +63,38 @@ describe("configureMaxTransport", () => {
     client.configureMaxTransport({ httpProxy: "   " });
     expect(proxyCalls).toHaveLength(0);
     expect(agentCalls).toHaveLength(1);
+  });
+});
+
+describe("getBotInfo cancellation", () => {
+  it("lifecycle abort cancels an active request promptly", async () => {
+    const controller = new AbortController();
+    fetchMock.mockImplementationOnce(async (_url: string, init: { signal: AbortSignal }) => {
+      await new Promise<void>((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    });
+
+    const request = client.getBotInfo(TOKEN, controller.signal);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    controller.abort(new DOMException("account stopped", "AbortError"));
+
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
+    expect((fetchMock.mock.calls[0]?.[1]?.signal as AbortSignal).aborted).toBe(true);
+  });
+
+  it("request timeout remains active without lifecycle abort", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementationOnce(async (_url: string, init: { signal: AbortSignal }) => {
+      await new Promise<void>((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    });
+
+    const request = client.getBotInfo(TOKEN);
+    const rejected = expect(request).rejects.toMatchObject({ name: "TimeoutError" });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
   });
 });
 

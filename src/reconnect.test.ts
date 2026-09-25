@@ -32,6 +32,15 @@ test("startup verification retries a transient failure then succeeds", async () 
   assert.deepEqual(retries, [1]);
 });
 
+test("bounded retry exhausts at maxAttempts", async () => {
+  let calls = 0;
+  await assert.rejects(retryWithBackoff(async () => {
+    calls += 1;
+    throw new TypeError("still broken");
+  }, { isRetryable: () => true, maxAttempts: 3, sleep: immediate }), /still broken/);
+  assert.equal(calls, 3);
+});
+
 test("startup verification retries a request timeout", async () => {
   let calls = 0;
   const result = await retryWithBackoff(async () => {

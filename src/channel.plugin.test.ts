@@ -401,6 +401,24 @@ describe("запуск канала", () => {
     expect(client.getUpdates).not.toHaveBeenCalled();
   });
 
+  it("передаёт lifecycle signal в активную проверку токена и быстро останавливается", async () => {
+    const ctl = abortable();
+    client.getBotInfo.mockImplementationOnce(async (_token: string, signal: AbortSignal) => {
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.waitFor(() => expect(client.getBotInfo).toHaveBeenCalledWith("tok", ctl.signal));
+    ctl.abort();
+    await started;
+
+    expect(client.getBotInfo).toHaveBeenCalledTimes(1);
+    expect(client.getUpdates).not.toHaveBeenCalled();
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("Connection lost during token verification"));
+  });
+
   it("временный сбой проверки токена повторяется и затем подключается", async () => {
     vi.useFakeTimers();
     client.getBotInfo
