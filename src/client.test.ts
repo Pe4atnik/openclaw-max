@@ -249,6 +249,43 @@ describe("загрузка файлов", () => {
     fetchMock.mockResolvedValueOnce(fail());
     await expect(client.getUploadUrl(TOKEN, "image")).resolves.toBeNull();
   });
+  it("createUpload принимает актуальный ответ без token", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ url: "https://up.test/file" }));
+    await expect(client.createUpload(TOKEN, "file")).resolves.toEqual({
+      url: "https://up.test/file",
+      token: "",
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "https://platform-api2.max.ru/uploads?type=file",
+      expect.objectContaining({
+        method: "POST",
+        headers: { Authorization: TOKEN },
+        body: undefined,
+      }),
+    );
+  });
+  it("upload diagnostics не печатает ответ или токен", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      text: async () => JSON.stringify({
+        code: "invalid.parameter",
+        message: "Bad type",
+        token: "secret-token",
+        details: "private-body",
+      }),
+    });
+
+    await expect(client.getUploadUrl("super-secret-auth", "image")).resolves.toBeNull();
+
+    const output = warn.mock.calls.flat().join(" ");
+    expect(output).toContain("MAX API POST /uploads → 400: invalid.parameter: Bad type");
+    expect(output).not.toContain("secret-token");
+    expect(output).not.toContain("private-body");
+    expect(output).not.toContain("super-secret-auth");
+    warn.mockRestore();
+  });
 
   it("uploadFile понимает токен на верхнем уровне и в photos", async () => {
     fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: "t1" }) });

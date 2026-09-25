@@ -21,6 +21,25 @@ import { RUSSIAN_TRUSTED_CA } from "./max-ca.js";
 const MAX_API = "https://platform-api2.max.ru";
 const REQUEST_TIMEOUT_MS = 30_000;
 const LONG_POLL_TIMEOUT_SEC = 30;
+export class MaxApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = "MaxApiError";
+  }
+}
+
+function safeResponseSummary(text: string): string {
+  if (!text) return "empty response";
+  try {
+    const value = JSON.parse(text) as { code?: unknown; message?: unknown };
+    const code = typeof value?.code === "string" ? value.code : "unknown";
+    const message = typeof value?.message === "string" ? value.message : "no message";
+    return `${code}: ${message}`.slice(0, 500);
+  } catch {
+    return "non-JSON response";
+  }
+}
+
 
 // ─── TLS / proxy transport ────────────────────────────────────────────────────
 
@@ -96,7 +115,10 @@ async function maxRequest<T>(
 
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`MAX API ${method} ${path} → ${res.status}: ${text}`);
+      throw new MaxApiError(
+        `MAX API ${method} ${path} → ${res.status}: ${safeResponseSummary(text)}`,
+        res.status,
+      );
     }
     return JSON.parse(text) as T;
   } finally {
@@ -231,7 +253,7 @@ export async function getUpdates(
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`GET /updates → ${res.status}: ${text}`);
+      throw new MaxApiError(`GET /updates → ${res.status}: ${text}`, res.status);
     }
     return (await res.json()) as MaxUpdatesResponse;
   } catch (err) {
@@ -297,7 +319,8 @@ export async function getUploadUrl(token: string, type: "image" | "video" | "aud
   try {
     const res = await maxRequest<{ url: string }>(token, "POST", "/uploads", { type });
     return res?.url ?? null;
-  } catch {
+  } catch (err) {
+    console.warn(`[openclaw-max] getUploadUrl error: ${err instanceof Error ? err.message : err}`);
     return null;
   }
 }
@@ -399,8 +422,11 @@ export async function createUpload(
 ): Promise<MaxUploadTarget | null> {
   try {
     const res = await maxRequest<Partial<MaxUploadTarget>>(token, "POST", "/uploads", { type });
-    return res?.url && res?.token ? { url: res.url, token: res.token } : null;
-  } catch {
+    return typeof res?.url === "string"
+      ? { url: res.url, token: typeof res.token === "string" ? res.token : "" }
+      : null;
+  } catch (err) {
+    console.warn(`[openclaw-max] createUpload error: ${err instanceof Error ? err.message : err}`);
     return null;
   }
 }
