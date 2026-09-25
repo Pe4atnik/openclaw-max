@@ -62,6 +62,102 @@ describe("configureMaxTransport", () => {
   });
 });
 
+describe("uploadToUrl", () => {
+  it("сохраняет multipart, Content-Length и JSON-токен", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ token: "uploaded-token" }));
+
+    await expect(client.uploadToUrl(
+      "https://upload.test/path",
+      Buffer.from("payload"),
+      "image/png",
+      "photo.png",
+    )).resolves.toEqual({ token: "uploaded-token" });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, Record<string, any>];
+    const body = init.body as Buffer;
+    expect(url).toBe("https://upload.test/path");
+    expect(init.method).toBe("POST");
+    expect(init.headers["Content-Type"]).toMatch(/^multipart\/form-data; boundary=/);
+    expect(init.headers["Content-Length"]).toBe(String(body.length));
+    expect(body.toString()).toContain("Content-Type: image/png\r\n\r\npayload");
+    expect(body.toString()).toContain('filename="photo.png"');
+  });
+
+  it.each([
+    "image/png\r\nX-Evil: yes",
+    "image/png\nX-Evil: yes",
+    "image",
+    "image/png; charset=utf-8",
+    " image/png",
+    "image/(png)",
+    "",
+  ])("подменяет небезопасный MIME на application/octet-stream: %j", async (mimeType) => {
+    fetchMock.mockResolvedValueOnce(ok({ token: "uploaded-token" }));
+
+    await client.uploadToUrl(
+      "https://upload.test/path",
+      Buffer.from("payload"),
+      mimeType,
+      "photo.png",
+    );
+
+    const init = fetchMock.mock.calls[0][1] as Record<string, any>;
+    const wire = (init.body as Buffer).toString();
+    expect(wire).toContain("Content-Type: application/octet-stream\r\n\r\npayload");
+    expect(wire).not.toContain("X-Evil:");
+    expect(init.headers["Content-Length"]).toBe(String((init.body as Buffer).length));
+  });
+
+  it("экранирует управляющие символы и кавычку в имени файла", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ token: "uploaded-token" }));
+
+    await client.uploadToUrl(
+      "https://upload.test/path",
+      Buffer.from("payload"),
+      "application/vnd.example+json",
+      "bad\r\n\"name.json",
+    );
+
+    const init = fetchMock.mock.calls[0][1] as Record<string, any>;
+    const wire = (init.body as Buffer).toString();
+    expect(wire).toContain('filename="bad___name.json"');
+    expect(wire).toContain("Content-Type: application/vnd.example+json");
+  });
+
+  it("сохраняет успешный не-JSON ответ как загрузку без токена", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, text: async () => "<retval>1</retval>" });
+    await expect(client.uploadToUrl(
+      "https://upload.test/path",
+      Buffer.from("payload"),
+      "audio/ogg",
+      "voice.ogg",
+    )).resolves.toEqual({ token: null });
+  });
+
+  it("возвращает null при HTTP-ошибке и не раскрывает тело ответа", async () => {
+    const text = vi.fn(async () => "token=server-secret&body=password");
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 403, text });
+
+    await expect(client.uploadToUrl(
+      "https://upload.test/path?token=request-secret",
+      Buffer.from("request-body-secret"),
+      "text/plain",
+      "note.txt",
+    )).resolves.toBeNull();
+    expect(text).not.toHaveBeenCalled();
+  });
+
+  it("возвращает null при сетевой ошибке", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("request body and token leaked by transport"));
+    await expect(client.uploadToUrl(
+      "https://upload.test/path",
+      Buffer.from("payload"),
+      "text/plain",
+      "note.txt",
+    )).resolves.toBeNull();
+  });
+});
+
 describe("отправка и правка сообщений", () => {
   it("sendDm возвращает mid", async () => {
     fetchMock.mockResolvedValueOnce(ok({ message: { body: { mid: "mid-1" } } }));

@@ -230,29 +230,31 @@ export function collectOutboundMedia(payload: DeliverPayload): OutboundMediaItem
  * унесло бы весь ответ, а не одно вложение.
  */
 function safeFileName(raw: string): string {
+  let decoded = raw;
   try {
-    return decodeURIComponent(raw);
+    decoded = decodeURIComponent(raw);
   } catch {
-    return raw;
+    // Keep the undecoded name when it contains an invalid percent escape.
   }
+  // A URL basename can contain encoded separators. Do not let decoding turn it
+  // back into a path or multipart filename with directory components.
+  return decoded.replace(/[\\/]/g, "_");
 }
 
-/** Прочитать вложение: локальный файл или ссылка. */
+/** Прочитать вложение только через проверенный OpenClaw media-access hook. */
 async function readOutboundMedia(
   ref: string,
   mediaReadFile?: (filePath: string) => Promise<Buffer>,
 ): Promise<Buffer> {
-  if (/^https?:\/\//i.test(ref)) {
-    const res = await fetch(ref);
-    if (!res.ok) throw new Error(`media fetch failed: ${res.status}`);
-    return Buffer.from(await res.arrayBuffer());
+  if (!mediaReadFile) {
+    throw new Error("MAX outbound media requires OpenClaw mediaReadFile");
   }
-  const localPath = ref.startsWith("file://")
-    ? (await import("node:url")).fileURLToPath(ref)
-    : ref;
-  if (mediaReadFile) return Buffer.from(await mediaReadFile(localPath));
-  const { readFile } = await import("node:fs/promises");
-  return readFile(localPath);
+  try {
+    return Buffer.from(await mediaReadFile(ref));
+  } catch {
+    // Do not reflect signed URLs, local paths, request bodies or loader details.
+    throw new Error("OpenClaw could not read outbound media for MAX");
+  }
 }
 
 export function createStreamingDeliver(
@@ -264,6 +266,7 @@ export function createStreamingDeliver(
   mode: MaxProgressDraftMode,
   seed: string,
   log?: any,
+  mediaReadFile?: (filePath: string) => Promise<Buffer>,
 ): {
   onPartialToken: (text: string) => Promise<void>;
   onWorkStart: () => Promise<void>;
@@ -338,7 +341,7 @@ export function createStreamingDeliver(
     const target = maxTarget();
     let text = caption;
     for (const item of items) {
-      const buffer = await readOutboundMedia(item.ref);
+      const buffer = await readOutboundMedia(item.ref, mediaReadFile);
       const uploadUrl = await getUploadUrl(account.token, "image");
       if (!uploadUrl) throw new Error("Failed to get MAX upload URL");
       const uploaded = await uploadFile(uploadUrl, buffer, item.mimeType || "image/jpeg", item.name);
@@ -361,7 +364,7 @@ export function createStreamingDeliver(
     const target = maxTarget();
     let text = caption;
     for (const item of items) {
-      const buffer = await readOutboundMedia(item.ref);
+      const buffer = await readOutboundMedia(item.ref, mediaReadFile);
       const upload = await createUpload(account.token, "audio");
       if (!upload) throw new Error("Failed to create MAX audio upload");
       const stored = await uploadToUrl(upload.url, buffer, item.mimeType || "audio/ogg", item.name);

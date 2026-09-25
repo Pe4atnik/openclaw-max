@@ -247,7 +247,10 @@ describe("исходящая отправка", () => {
     expect(client.sendDmWithImage).toHaveBeenCalledWith("tok", 42, "без MIME", "img");
   });
 
-  it("читает mediaUrl по актуальному контракту OpenClaw и распознаёт PNG", async () => {
+  it.each([
+    ["локальный путь", "/tmp/openclaw/test-no-mime.png"],
+    ["HTTPS URL", "https://media.test/signed/test-no-mime.png?token=secret"],
+  ])("читает mediaUrl (%s) только через контракт OpenClaw", async (_label, mediaUrl) => {
     client.getUploadUrl.mockResolvedValueOnce("https://up.test");
     client.uploadFile.mockResolvedValueOnce({ token: "img" });
     client.sendDmWithImage.mockResolvedValueOnce("mid-url-png");
@@ -256,14 +259,14 @@ describe("исходящая отправка", () => {
     const mediaReadFile = vi.fn().mockResolvedValue(png);
     const res = await plugin.outbound.sendMedia({
       to: "42",
-      mediaUrl: "/tmp/openclaw/test-no-mime.png",
+      mediaUrl,
       mediaReadFile,
       text: "актуальный контракт",
       cfg,
       chatType: "direct",
     });
 
-    expect(mediaReadFile).toHaveBeenCalledWith("/tmp/openclaw/test-no-mime.png");
+    expect(mediaReadFile).toHaveBeenCalledWith(mediaUrl);
     expect(client.createUpload).not.toHaveBeenCalled();
     expect(client.uploadFile).toHaveBeenCalledWith(
       "https://up.test",
@@ -273,6 +276,68 @@ describe("исходящая отправка", () => {
     );
     expect(client.sendDmWithImage).toHaveBeenCalledWith("tok", 42, "актуальный контракт", "img");
     expect(res.messageId).toBe("mid-url-png");
+  });
+
+  it.each([
+    "https://127.0.0.1/admin?token=must-not-leak",
+    "/etc/passwd",
+    "file:///etc/shadow",
+  ])("не делает прямой HTTP/fs fallback без mediaReadFile: %s", async (mediaUrl) => {
+    await expect(plugin.outbound.sendMedia({
+      to: "42",
+      mediaUrl,
+      cfg,
+      chatType: "direct",
+    })).rejects.toThrow("MAX outbound media requires OpenClaw mediaReadFile");
+
+    expect(client.getUploadUrl).not.toHaveBeenCalled();
+    expect(client.createUpload).not.toHaveBeenCalled();
+  });
+
+  it("скрывает URL, токен и ошибку mediaReadFile при отказе загрузчика", async () => {
+    const mediaReadFile = vi.fn().mockRejectedValue(
+      new Error("GET https://media.test/file?token=super-secret body=password"),
+    );
+
+    let error: unknown;
+    try {
+      await plugin.outbound.sendMedia({
+        to: "42",
+        mediaUrl: "https://media.test/file?token=super-secret",
+        mediaReadFile,
+        cfg,
+        chatType: "direct",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toEqual(new Error("OpenClaw could not read outbound media for MAX"));
+    expect(String(error)).not.toContain("super-secret");
+    expect(String(error)).not.toContain("password");
+    expect(client.getUploadUrl).not.toHaveBeenCalled();
+  });
+
+  it("не превращает декодированные разделители URL в путь имени файла", async () => {
+    client.createUpload.mockResolvedValueOnce({ url: "https://up.test", token: "file-token" });
+    client.uploadToUrl.mockResolvedValueOnce({ token: null });
+    client.sendWithAttachment.mockResolvedValueOnce("mid-file");
+    const mediaReadFile = vi.fn().mockResolvedValue(Buffer.from("payload"));
+
+    await plugin.outbound.sendMedia({
+      to: "42",
+      mediaUrl: "https://media.test/files/nested%2Fsecret%5Cname.bin?token=hidden",
+      mediaReadFile,
+      cfg,
+      chatType: "direct",
+    });
+
+    expect(client.uploadToUrl).toHaveBeenCalledWith(
+      "https://up.test",
+      expect.any(Buffer),
+      "application/octet-stream",
+      "nested_secret_name.bin",
+    );
   });
 
   it("в группу картинка уходит своим вызовом", async () => {

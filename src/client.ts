@@ -66,10 +66,14 @@ function encodeMultipart(buffer: Buffer, mimeType: string, filename: string): {
 } {
   const boundary = `----openclaw-max-${crypto.randomUUID()}`;
   const safeName = filename.replace(/[\r\n"]/g, "_");
+  // MIME is emitted into a multipart header. Accept only a strict RFC token
+  // type/subtype pair; malformed or injected values become inert binary data.
+  const mimeToken = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+  const safeMimeType = mimeToken.test(mimeType) ? mimeType : "application/octet-stream";
   const head = Buffer.from(
     `--${boundary}\r\n` +
     `Content-Disposition: form-data; name="data"; filename="${safeName}"\r\n` +
-    `Content-Type: ${mimeType}\r\n\r\n`,
+    `Content-Type: ${safeMimeType}\r\n\r\n`,
   );
   const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
   return {

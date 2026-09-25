@@ -328,7 +328,8 @@ describe("длинный опрос", () => {
 });
 
 describe("вложение по ссылке", () => {
-  const draftlessDeliverer = () =>
+  const mediaReadFile = vi.fn();
+  const draftlessDeliverer = (loader: ((ref: string) => Promise<Buffer>) | null = mediaReadFile) =>
     createStreamingDeliver(
       { accountId: "default", token: "tok", enabled: true } as never,
       "42",
@@ -338,13 +339,11 @@ describe("вложение по ссылке", () => {
       "progress" as never,
       "seed",
       log,
+      loader ?? undefined,
     );
 
-  it("картинка по http скачивается перед загрузкой", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      arrayBuffer: async () => new TextEncoder().encode("img").buffer,
-    } as never);
+  it("картинка по http читается platform loader перед загрузкой", async () => {
+    mediaReadFile.mockResolvedValueOnce(Buffer.from("img"));
     client.getUploadUrl.mockResolvedValue("https://up.test");
     client.uploadFile.mockResolvedValue({ token: "img" });
     client.sendDmWithImage.mockResolvedValue("mid-img");
@@ -353,21 +352,35 @@ describe("вложение по ссылке", () => {
     await deliver({ text: "", mediaUrl: "https://cdn.test/a.png" }, { kind: "final" });
     await finish();
 
-    expect(fetchSpy).toHaveBeenCalledWith("https://cdn.test/a.png");
+    expect(mediaReadFile).toHaveBeenCalledWith("https://cdn.test/a.png");
     expect(client.sendDmWithImage).toHaveBeenCalled();
-    fetchSpy.mockRestore();
   });
 
-  it("недоступная ссылка гасится и попадает в лог", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue({ ok: false, status: 404 } as never);
+  it("ошибка platform loader гасится, редактируется и попадает в лог", async () => {
+    mediaReadFile.mockRejectedValueOnce(new Error("token=secret request-body=password"));
     const { deliver, finish } = draftlessDeliverer();
 
     await deliver({ text: "Готово", mediaUrl: "https://cdn.test/a.png" }, { kind: "final" });
     await finish();
 
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("media fetch failed: 404"));
+    expect(log.error).toHaveBeenCalledWith(
+      "[openclaw-max] вложение отправить не удалось: OpenClaw could not read outbound media for MAX",
+    );
+    expect(String(log.error.mock.calls)).not.toContain("secret");
+    expect(String(log.error.mock.calls)).not.toContain("password");
+  });
+
+  it("без platform loader URL не вызывает fetch и закрывается отказом", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const { deliver, finish } = draftlessDeliverer(null);
+
+    await deliver({ text: "Готово", mediaUrl: "https://127.0.0.1/a.png" }, { kind: "final" });
+    await finish();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(
+      "[openclaw-max] вложение отправить не удалось: MAX outbound media requires OpenClaw mediaReadFile",
+    );
     fetchSpy.mockRestore();
   });
 
