@@ -19,9 +19,13 @@ import { listAccountIds, resolveAccount } from "./accounts.js";
 import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, deleteMessage, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile, configureMaxTransport } from "./client.js";
 import { getMaxRuntime } from "./runtime.js";
 import { createWebhookHandler, handleUpdate } from "./webhook-handler.js";
-import type { InboundImage } from "./webhook-handler.js";
 import type { ResolvedMaxAccount } from "./types.js";
 import { isAbortError, isRetryableError, retryWithBackoff, runResilientPolling } from "./reconnect.js";
+
+interface InboundImage {
+  data: string;
+  mimeType: string;
+}
 
 const CHANNEL_ID = "max";
 
@@ -718,7 +722,7 @@ async function startWebhookMode(ctx: any, account: ResolvedMaxAccount, _cfg: unk
 
   const handler = createWebhookHandler({
     account,
-    deliver: async (msg) => {
+    deliver: async (msg: Parameters<typeof deliverMessage>[0]) => {
       const currentCfg = _cfg;
       await deliverMessage(msg, account, currentCfg, log);
       return null;
@@ -777,7 +781,7 @@ async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg:
           await handleUpdate(
             update,
             account,
-            async (msg) => {
+            async (msg: Parameters<typeof deliverMessage>[0]) => {
               await deliverMessage(msg, account, currentCfg, log);
               return null;
             },
