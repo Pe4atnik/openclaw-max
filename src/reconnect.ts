@@ -9,6 +9,7 @@ export interface BackoffOptions {
 export interface RetryOptions extends BackoffOptions {
   isRetryable: (error: unknown) => boolean;
   onRetry?: (error: unknown, consecutiveErrors: number, delayMs: number) => void;
+  maxAttempts?: number;
 }
 
 export interface PollingOptions<T> extends RetryOptions {
@@ -81,6 +82,7 @@ export async function retryWithBackoff<T>(operation: () => Promise<T>, options: 
       if (options.signal?.aborted) throw error;
       if (!options.isRetryable(error)) throw error;
       consecutiveErrors += 1;
+      if (consecutiveErrors >= (options.maxAttempts ?? Number.POSITIVE_INFINITY)) throw error;
       const delayMs = backoffDelay(
         consecutiveErrors,
         options.baseDelayMs,

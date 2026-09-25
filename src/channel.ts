@@ -898,7 +898,7 @@ export function createMaxPlugin(): any {
         }
 
         try {
-          const info = await retryWithBackoff(() => getBotInfo(account.token), {
+          const info = await retryWithBackoff(() => getBotInfo(account.token, ctx.abortSignal), {
             signal: ctx.abortSignal,
             isRetryable: isRetryableError,
             onRetry: (_err, attempt, delayMs) => log?.warn?.(
@@ -1011,10 +1011,11 @@ async function startWebhookMode(ctx: any, account: ResolvedMaxAccount, _cfg: unk
 
 // ─── Long polling mode ────────────────────────────────────────────────────────
 
-async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg: unknown, log: any) {
+async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, cfg: unknown, log: any) {
   log?.info?.(`[openclaw-max] Starting in long polling mode`);
   const signal: AbortSignal = ctx.abortSignal;
   let marker: number | null | undefined = undefined;
+  const updateRetryAttempts = 3;
 
   await runResilientPolling({
     signal,
@@ -1023,24 +1024,41 @@ async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg:
     onResult: async (result) => {
       if (result.updates.length > 0) {
         log?.info?.(`[openclaw-max] Received ${result.updates.length} update(s)`);
-        const currentCfg = _cfg;
-        for (const update of result.updates) {
-          try {
-            await handleUpdate(
+      }
+      for (const update of result.updates ?? []) {
+        if (signal?.aborted) return;
+        try {
+          await retryWithBackoff(
+            () => handleUpdate(
               update,
               account,
               async (msg: InboundDelivery) => {
-                await deliverMessage(msg, account, currentCfg, log);
+                await deliverMessage(msg, account, cfg, log);
                 return null;
               },
               log,
-            );
-          } catch (error) {
-            const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-            log?.error?.(`[openclaw-max] Failed to process MAX update; skipping it: ${detail}`);
-          }
+            ),
+            {
+            signal,
+            maxAttempts: updateRetryAttempts,
+            isRetryable: () => true,
+            baseDelayMs: 250,
+            maxDelayMs: 2_000,
+              onRetry: (error, attempt, delayMs) => log?.warn?.(
+                `[openclaw-max] MAX update processing failed; retry ${attempt}/${updateRetryAttempts - 1} in ${delayMs}ms: ${String(error)}`,
+              ),
+            },
+          );
+        } catch (error) {
+          if (signal?.aborted) return;
+          log?.error?.(
+            `[openclaw-max] Failed to process MAX update after ${updateRetryAttempts} attempts; marker not advanced: ${String(error)}`,
+          );
+          throw error;
         }
       }
+      // Commit only after the complete batch succeeds. On exhaustion, MAX can
+      // redeliver it; already completed updates may therefore be duplicated.
       if (result.marker != null) marker = result.marker;
     },
     onConnectionLost: () => log?.warn?.(`[openclaw-max] MAX connection lost; retrying long polling`),

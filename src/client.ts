@@ -56,6 +56,7 @@ async function maxRequest<T>(
   path: string,
   params?: Record<string, string | number>,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<T> {
   const url = new URL(`${MAX_API}${path}`);
   if (params) {
@@ -72,7 +73,13 @@ async function maxRequest<T>(
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const abortFromCaller = (): void => controller.abort(signal?.reason);
+  if (signal?.aborted) abortFromCaller();
+  else signal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("MAX API request timed out", "TimeoutError")),
+    REQUEST_TIMEOUT_MS,
+  );
 
   try {
     const res = await fetch(url.toString(), {
@@ -90,6 +97,7 @@ async function maxRequest<T>(
     return JSON.parse(text) as T;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
@@ -258,8 +266,8 @@ export async function deleteWebhook(token: string): Promise<void> {
 /**
  * Get bot info (used to verify token on startup).
  */
-export async function getBotInfo(token: string): Promise<{ name: string; username: string }> {
-  return maxRequest(token, "GET", "/me");
+export async function getBotInfo(token: string, signal?: AbortSignal): Promise<{ name: string; username: string }> {
+  return maxRequest(token, "GET", "/me", undefined, undefined, signal);
 }
 
 /**
