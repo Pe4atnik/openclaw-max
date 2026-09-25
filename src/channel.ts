@@ -166,6 +166,34 @@ const AUDIO_MIME_BY_EXT: Record<string, string> = {
   aac: "audio/aac",
 };
 
+function inferOutboundMediaType(
+  mimeType: string | undefined,
+  filename: string | undefined,
+  buffer: Buffer,
+): "image" | "video" | "audio" | "file" {
+  if (mimeType?.startsWith("image/")) return "image";
+  if (mimeType?.startsWith("video/")) return "video";
+  if (mimeType?.startsWith("audio/")) return "audio";
+
+  const ext = filename?.split(/[?#]/, 1)[0]?.split(".").pop()?.toLowerCase();
+  if (ext && IMAGE_MIME_BY_EXT[ext]) return "image";
+  if (ext && AUDIO_MIME_BY_EXT[ext]) return "audio";
+  if (ext && ["mp4", "mov", "mkv", "webm", "avi"].includes(ext)) return "video";
+
+  // OpenClaw's modern outbound bridge may provide a prepared Buffer without
+  // mimeType/filename. Sniff common image signatures so valid images do not
+  // fall through to MAX's generic-file upload flow.
+  if (
+    (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) ||
+    (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) ||
+    (buffer.length >= 6 && (buffer.subarray(0, 6).toString("ascii") === "GIF87a" || buffer.subarray(0, 6).toString("ascii") === "GIF89a")) ||
+    (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") ||
+    (buffer.length >= 2 && buffer.subarray(0, 2).toString("ascii") === "BM")
+  ) return "image";
+
+  return "file";
+}
+
 /**
  * Собрать вложения ответа: ссылки из нагрузки плюс тип файла.
  *
@@ -815,10 +843,7 @@ export function createMaxPlugin(): any {
         if (isNaN(numericId)) throw new Error(`Invalid MAX user ID: ${to}`);
 
         // Determine media type
-        const mediaType = mimeType?.startsWith("image/") ? "image"
-          : mimeType?.startsWith("video/") ? "video"
-          : mimeType?.startsWith("audio/") ? "audio"
-          : "file";
+        const mediaType = inferOutboundMediaType(mimeType, filename, buffer);
 
         const text = caption ?? "";
         let mid: string | null = null;

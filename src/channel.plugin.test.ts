@@ -227,6 +227,25 @@ describe("исходящая отправка", () => {
     expect(res.messageId).toBe("mid-img");
   });
 
+  it("распознаёт PNG по байтам, когда outbound bridge не передал MIME", async () => {
+    client.getUploadUrl.mockResolvedValueOnce("https://up.test");
+    client.uploadFile.mockResolvedValueOnce({ token: "img" });
+    client.sendDmWithImage.mockResolvedValueOnce("mid-png");
+
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    await plugin.outbound.sendMedia({
+      to: "42",
+      buffer: png,
+      caption: "без MIME",
+      cfg,
+      chatType: "direct",
+    });
+
+    expect(client.getUploadUrl).toHaveBeenCalledWith("tok", "image");
+    expect(client.createUpload).not.toHaveBeenCalled();
+    expect(client.sendDmWithImage).toHaveBeenCalledWith("tok", 42, "без MIME", "img");
+  });
+
   it("в группу картинка уходит своим вызовом", async () => {
     client.getUploadUrl.mockResolvedValueOnce("https://up.test");
     client.uploadFile.mockResolvedValueOnce({ token: "img" });
