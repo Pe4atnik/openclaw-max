@@ -14,7 +14,7 @@ import tls from "node:tls";
 // built-in undici copy, which rejects a dispatcher built by this (possibly
 // different) undici version with UND_ERR_INVALID_ARG. Same-package fetch+Agent
 // are guaranteed compatible.
-import { fetch, FormData, Agent, ProxyAgent, type Dispatcher } from "undici";
+import { fetch, Agent, ProxyAgent, type Dispatcher } from "undici";
 import type { MaxUpdatesResponse } from "./types.js";
 import { RUSSIAN_TRUSTED_CA } from "./max-ca.js";
 
@@ -39,6 +39,24 @@ export function configureMaxTransport(opts?: { httpProxy?: string }): void {
   dispatcher = proxy
     ? new ProxyAgent({ uri: proxy, connect: { ca: MAX_CA } })
     : new Agent({ connect: { ca: MAX_CA } });
+}
+
+function encodeMultipart(buffer: Buffer, mimeType: string, filename: string): {
+  body: Buffer;
+  contentType: string;
+} {
+  const boundary = `----openclaw-max-${crypto.randomUUID()}`;
+  const safeName = filename.replace(/[\r\n"]/g, "_");
+  const head = Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="data"; filename="${safeName}"\r\n` +
+    `Content-Type: ${mimeType}\r\n\r\n`,
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+  return {
+    body: Buffer.concat([head, buffer, tail]),
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
 }
 
 // ─── Low-level fetch helper ───────────────────────────────────────────────────
@@ -290,11 +308,14 @@ export async function getUploadUrl(token: string, type: "image" | "video" | "aud
  */
 export async function uploadFile(uploadUrl: string, buffer: Buffer, mimeType: string, filename: string): Promise<{ token: string } | null> {
   try {
-    const form = new FormData();
-    form.append("data", new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
+    const { body, contentType } = encodeMultipart(buffer, mimeType, filename);
     const res = await fetch(uploadUrl, {
       method: "POST",
-      body: form,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(body.length),
+      },
+      body,
       dispatcher,
     });
     if (!res.ok) return null;
@@ -396,9 +417,16 @@ export async function uploadToUrl(
   filename: string,
 ): Promise<{ token: string | null } | null> {
   try {
-    const form = new FormData();
-    form.append("data", new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
-    const res = await fetch(uploadUrl, { method: "POST", body: form, dispatcher });
+    const { body, contentType } = encodeMultipart(buffer, mimeType, filename);
+    const res = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(body.length),
+      },
+      body,
+      dispatcher,
+    });
     if (!res.ok) return null;
     const text = await res.text();
     try {

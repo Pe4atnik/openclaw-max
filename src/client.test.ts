@@ -266,6 +266,25 @@ describe("загрузка файлов", () => {
     ).resolves.toEqual({ token: "t2" });
   });
 
+  it("uploadFile задаёт Content-Length для MAX multipart-загрузчика", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ photos: { id: { token: "t" } } }),
+    });
+
+    await client.uploadFile("https://up.test", Buffer.from("image"), "image/png", 'a"\r\n.png');
+
+    const [, init] = fetchMock.mock.calls[0];
+    const body = init?.body as Buffer;
+    const headers = init?.headers as Record<string, string>;
+    expect(Buffer.isBuffer(body)).toBe(true);
+    expect(headers["Content-Type"]).toMatch(/^multipart\/form-data; boundary=/);
+    expect(headers["Content-Length"]).toBe(String(body.length));
+    expect(body.toString()).toContain('name="data"; filename="a___.png"');
+    expect(body.includes(Buffer.from("image"))).toBe(true);
+  });
+
   it("uploadFile без токена и на сбое отдаёт null", async () => {
     fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) });
     await expect(
