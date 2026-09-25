@@ -97,6 +97,7 @@ function abortable() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  client.getBotInfo.mockReset();
   client.sendTypingAction.mockResolvedValue(undefined);
   client.markSeen.mockResolvedValue(undefined);
 });
@@ -244,6 +245,34 @@ describe("исходящая отправка", () => {
     expect(client.getUploadUrl).toHaveBeenCalledWith("tok", "image");
     expect(client.createUpload).not.toHaveBeenCalled();
     expect(client.sendDmWithImage).toHaveBeenCalledWith("tok", 42, "без MIME", "img");
+  });
+
+  it("читает mediaUrl по актуальному контракту OpenClaw и распознаёт PNG", async () => {
+    client.getUploadUrl.mockResolvedValueOnce("https://up.test");
+    client.uploadFile.mockResolvedValueOnce({ token: "img" });
+    client.sendDmWithImage.mockResolvedValueOnce("mid-url-png");
+
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    const mediaReadFile = vi.fn().mockResolvedValue(png);
+    const res = await plugin.outbound.sendMedia({
+      to: "42",
+      mediaUrl: "/tmp/openclaw/test-no-mime.png",
+      mediaReadFile,
+      text: "актуальный контракт",
+      cfg,
+      chatType: "direct",
+    });
+
+    expect(mediaReadFile).toHaveBeenCalledWith("/tmp/openclaw/test-no-mime.png");
+    expect(client.createUpload).not.toHaveBeenCalled();
+    expect(client.uploadFile).toHaveBeenCalledWith(
+      "https://up.test",
+      png,
+      "application/octet-stream",
+      "test-no-mime.png",
+    );
+    expect(client.sendDmWithImage).toHaveBeenCalledWith("tok", 42, "актуальный контракт", "img");
+    expect(res.messageId).toBe("mid-url-png");
   });
 
   it("в группу картинка уходит своим вызовом", async () => {
