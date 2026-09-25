@@ -87,7 +87,7 @@ Should show: `MAX default: enabled, dm:allowlist, allow:YOUR_USER_ID`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `token` | string | required | MAX Bot API token |
+| `token` | string \| SecretRef | required | MAX Bot API token, plain or a SecretRef (see below) |
 | `enabled` | boolean | `true` | Enable/disable channel |
 | `dmPolicy` | string | `"allowlist"` | DM access policy: `open`, `allowlist`, `closed` |
 | `allowFrom` | string[] | `[]` | MAX user IDs allowed to DM (when dmPolicy=allowlist) |
@@ -96,6 +96,27 @@ Should show: `MAX default: enabled, dm:allowlist, allow:YOUR_USER_ID`
 | `webhookUrl` | string | — | Webhook URL (optional, uses long polling if not set) |
 | `webhookSecret` | string | — | Webhook secret for request verification |
 | `httpProxy` | string | — | Optional HTTP(S) proxy for MAX API traffic, e.g. `http://user:pass@host:port` |
+
+### Token as a SecretRef
+
+Instead of the plain token, `token` (at the channel level or in `accounts.<id>`)
+can point to a secret the gateway resolves at startup, so the config file holds
+no credential:
+
+```json5
+{
+  channels: {
+    max: {
+      token: { source: "exec", provider: "my-keychain", id: "max-bot-token" },
+      // or { source: "env", provider: "default", id: "MAX_BOT_TOKEN" }
+    }
+  }
+}
+```
+
+The provider is declared under `secrets.providers`. If the reference cannot be
+resolved, the gateway marks the account unavailable and the plugin does not start
+it; the log names the unresolved reference. Check with `openclaw secrets audit`.
 
 ## MAX API migration (July 2026)
 
@@ -121,6 +142,12 @@ resolver (canonical keys) instead of a flat `max:<senderId>`.
 > session history that one time. This is expected, not a bug.
 
 ## Webhook mode (optional)
+
+Long polling processes updates in order and retries a failed update up to three
+times before leaving the batch marker unchanged. A later poll can therefore
+redeliver the batch. This favors no loss, but an update completed before the
+failure can be delivered more than once; handlers should remain idempotent where
+possible.
 
 For production, configure a webhook instead of long polling:
 
