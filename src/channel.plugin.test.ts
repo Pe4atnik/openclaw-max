@@ -384,7 +384,7 @@ describe("запуск канала", () => {
   });
 
   it("неверный токен останавливает запуск после проверки", async () => {
-    client.getBotInfo.mockRejectedValueOnce(new Error("401 unauthorized"));
+    client.getBotInfo.mockRejectedValue(Object.assign(new Error("401 unauthorized"), { status: 401 }));
     const ctl = abortable();
 
     const started = plugin.gateway.startAccount({
@@ -393,10 +393,32 @@ describe("запуск канала", () => {
       log,
       abortSignal: ctl.signal,
     });
+    await vi.waitFor(() => expect(log.error).toHaveBeenCalledWith(expect.stringContaining("Token verification failed")));
+    ctl.abort();
     await started;
 
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining("Token verification failed"));
     expect(client.getUpdates).not.toHaveBeenCalled();
+  });
+
+  it("временный сбой проверки токена повторяется и затем подключается", async () => {
+    vi.useFakeTimers();
+    client.getBotInfo
+      .mockRejectedValueOnce(Object.assign(new Error("temporary"), { status: 503 }))
+      .mockResolvedValueOnce({ name: "бот", username: "bot" });
+    const ctl = abortable();
+    client.getUpdates.mockImplementation(async () => {
+      ctl.abort();
+      return { updates: [], marker: null };
+    });
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await started;
+
+    expect(client.getBotInfo).toHaveBeenCalledTimes(2);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("Connection lost during token verification"));
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("Connected as bot"));
   });
 
   it("с прокси транспорт настраивается до первого вызова", async () => {
@@ -462,7 +484,9 @@ describe("запуск канала", () => {
     client.getUpdates
       .mockResolvedValueOnce({ updates: [{ update_type: "message_created" }], marker: 11 })
       .mockImplementationOnce(async () => {
-        await new Promise<void>((resolve) => ctl.signal.addEventListener("abort", () => resolve(), { once: true }));
+        if (!ctl.signal.aborted) {
+          await new Promise<void>((resolve) => ctl.signal.addEventListener("abort", () => resolve(), { once: true }));
+        }
         return { updates: [], marker: 11 };
       });
 

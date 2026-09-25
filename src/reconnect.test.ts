@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { isRetryableError, retryWithBackoff, runResilientPolling } from "./reconnect.js";
+import {
+  abortableSleep,
+  isRetryableError,
+  retryWithBackoff,
+  runResilientPolling,
+} from "./reconnect.js";
 
 class StatusError extends Error {
   readonly status: number;
@@ -49,6 +54,52 @@ test("startup verification does not retry permanent auth failures", async () => 
     throw new StatusError("unauthorized", 401);
   }, { isRetryable: isRetryableError, sleep: immediate }), /unauthorized/);
   assert.equal(calls, 1);
+});
+
+test("retry classification covers HTTP, timeout and socket failures", () => {
+  assert.equal(isRetryableError(new StatusError("limited", 429)), true);
+  assert.equal(isRetryableError(new StatusError("bad request", 400)), false);
+  assert.equal(isRetryableError(Object.assign(new Error("slow"), { name: "TimeoutError" })), true);
+  assert.equal(isRetryableError(Object.assign(new Error("reset"), { code: "ECONNRESET" })), true);
+  assert.equal(isRetryableError(Object.assign(new Error("nested"), { cause: { code: "EAI_AGAIN" } })), true);
+  assert.equal(isRetryableError(Object.assign(new Error("other"), { code: "EINVAL" })), false);
+});
+
+test("abortable sleep resolves both pre-aborted and in-flight aborts", async () => {
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await abortableSleep(10_000, preAborted.signal);
+
+  const inFlight = new AbortController();
+  const sleeping = abortableSleep(10_000, inFlight.signal);
+  inFlight.abort();
+  await sleeping;
+});
+
+test("startup retry stops with AbortError when aborted during backoff", async () => {
+  const controller = new AbortController();
+  await assert.rejects(retryWithBackoff(async () => {
+    throw new TypeError("offline");
+  }, {
+    signal: controller.signal,
+    isRetryable: isRetryableError,
+    sleep: async () => controller.abort(),
+  }), (error: Error) => error.name === "AbortError");
+});
+
+test("polling exits quietly when its poll aborts the external signal", async () => {
+  const controller = new AbortController();
+  let handled = 0;
+  await runResilientPolling({
+    poll: async () => {
+      controller.abort();
+      throw new TypeError("aborted request");
+    },
+    onResult: () => { handled += 1; },
+    signal: controller.signal,
+    isRetryable: isRetryableError,
+  });
+  assert.equal(handled, 0);
 });
 
 test("long polling recovers after more than five failures", async () => {
