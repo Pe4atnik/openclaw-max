@@ -14,13 +14,21 @@ import {
   setAccountEnabledInConfigSection,
 } from "openclaw/plugin-sdk/core";
 import { registerPluginHttpRoute } from "openclaw/plugin-sdk/webhook-ingress";
+import { buildOptionalSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
 import { z } from "zod";
-import { listAccountIds, resolveAccount } from "./accounts.js";
-import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, deleteMessage, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile, configureMaxTransport } from "./client.js";
+import { describeMissingToken, listAccountIds, resolveAccount } from "./accounts.js";
+import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
+import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, markSeen, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile, configureMaxTransport, createUpload, uploadToUrl, sendWithAttachment } from "./client.js";
+import type { MaxSendTarget } from "./client.js";
+import { resolveChannelPreviewStreamMode } from "openclaw/plugin-sdk/channel-outbound";
+import {
+  createMaxProgressDraft,
+  type MaxProgressDraftMode,
+  type MaxStreamingEntry,
+} from "./progress-draft.js";
 import { getMaxRuntime } from "./runtime.js";
 import { createWebhookHandler, handleUpdate } from "./webhook-handler.js";
-import type { InboundImage } from "./webhook-handler.js";
-import type { ResolvedMaxAccount } from "./types.js";
+import type { InboundDelivery, InboundImage, ResolvedMaxAccount } from "./types.js";
 
 const CHANNEL_ID = "max";
 
@@ -28,15 +36,26 @@ const CHANNEL_ID = "max";
 const activeTypingStops = new Map<string, () => void>();
 let typingStopSeq = 0;
 
+/**
+ * Схема настроек канала.
+ *
+ * ⚠️ Приведение типа обязательно. Ядро держит свою копию zod (сейчас 4.5.4), а
+ * плагин — свою; когда npm ставит их рядом, структурно одинаковые схемы
+ * оказываются РАЗНЫМИ типами, и `tsc` спорит о внутренностях `$ZodCheck`
+ * вплоть до `Type '5' is not assignable to type '6'`. Локально этого не видно:
+ * там обе копии схлопываются в одну. Поймала проверка на двух версиях ядра.
+ */
 const MaxConfigSchema = buildChannelConfigSchema(
   z.object({
-    token: z.string().optional().describe("MAX Bot API token (from business.max.ru)"),
+    // Строка или SecretRef `{ source, provider, id }`: ссылку разрешает ядро
+    // (см. `secret-contract.ts`), до плагина доходит уже строка.
+    token: buildOptionalSecretInputSchema().describe("MAX Bot API token (from business.max.ru), plain or SecretRef"),
     enabled: z.boolean().optional().default(true).describe("Enable or disable this channel"),
     dmPolicy: z.enum(["open", "allowlist", "closed"]).optional().default("allowlist").describe("Who can send DMs"),
     allowFrom: z.array(z.string()).optional().describe("Allowed MAX user IDs (when dmPolicy=allowlist)"),
     webhookUrl: z.string().optional().describe("Webhook URL for production mode (optional, uses long polling if not set)"),
     webhookSecret: z.string().optional().describe("Webhook secret for verifying MAX requests"),
-  }).passthrough()
+  }).passthrough() as unknown as Parameters<typeof buildChannelConfigSchema>[0]
 );
 
 // Track active webhook route unregisters per account
@@ -52,14 +71,9 @@ function waitUntilAbort(signal?: AbortSignal, onAbort?: () => void): Promise<voi
 }
 
 /** Minimum interval between streaming edits (ms) to avoid rate limits */
-const STREAM_EDIT_INTERVAL_MS = 800;
 const TYPING_INTERVAL_MS = 4000;
 /** Leak guard only — reset on activity so long think/tool turns keep typing. */
 const TYPING_SAFETY_MS = 30 * 60 * 1000;
-const PLACEHOLDER_DELAY_MS = 500;
-const STATUS_MAX_LINES = 6;
-const STATUS_LINE_CHARS = 120;
-const PLACEHOLDER_TEXT = "⏳ обрабатываю…";
 
 /**
  * Send a reply to the user based on chat type.
@@ -86,30 +100,8 @@ function isSilentFinalText(text: unknown): boolean {
   return !t || t === "NO_REPLY" || t === "HEARTBEAT_OK";
 }
 
-function truncateStatus(text: unknown, max = STATUS_LINE_CHARS): string {
-  const t = String(text ?? "").replace(/\s+/g, " ").trim();
-  if (t.length <= max) return t;
-  return `${t.slice(0, Math.max(0, max - 1))}…`;
-}
 
-function toolStatusIcon(name: unknown): string {
-  const n = String(name ?? "").toLowerCase();
-  if (n.includes("search") || n.includes("web") || n.includes("fetch")) return "🔎";
-  if (n.includes("exec") || n.includes("bash") || n.includes("shell")) return "🛠️";
-  if (n === "read" || n.includes("read_file") || n.endsWith(".read")) return "📖";
-  if (n.includes("write") || n.includes("edit") || n.includes("apply_patch")) return "✍️";
-  return "⚙️";
-}
 
-function shortToolHint(args: unknown): string {
-  if (!args || typeof args !== "object") return "";
-  const rec = args as Record<string, unknown>;
-  const preferred = rec.command ?? rec.cmd ?? rec.query ?? rec.url ?? rec.path ?? rec.file ?? rec.target;
-  if (typeof preferred === "string" && preferred.trim()) return truncateStatus(preferred, 80);
-  return "";
-}
-
-type StreamPhase = "idle" | "status" | "streaming" | "done";
 
 /**
  * Create a streaming deliverer:
@@ -120,40 +112,156 @@ type StreamPhase = "idle" | "status" | "streaming" | "done";
  * MAX Bot API typing (`POST /chats/{chatId}/actions`, action typing_on) is documented
  * for group chats and is ephemeral; DMs need an editable placeholder to stay alive.
  */
-function createStreamingDeliver(
+/**
+ * Нагрузка одного ответа. Ядро кладёт сюда и текст, и медиа, и признак того,
+ * что текст уже показан (голосовой довесок).
+ */
+interface DeliverPayload {
+  text?: string;
+  body?: string;
+  mediaUrl?: string;
+  mediaUrls?: string[];
+  attachments?: Array<{
+    mediaUrl?: string;
+    url?: string;
+    path?: string;
+    filePath?: string;
+    mimeType?: string;
+  }>;
+  ttsSupplement?: { spokenText?: string; visibleTextAlreadyDelivered?: boolean };
+}
+
+/**
+ * Второй аргумент доставки. `kind` отличает промежуточный кусок работы от
+ * ответа, и без него рассказ «сейчас посмотрю» затирает готовый ответ:
+ * ядро отдаёт блоки не в том порядке, в каком они появляются в чате.
+ */
+interface DeliverInfo {
+  kind?: string;
+}
+
+/** Одно вложение ответа, приведённое к тому, что нужно для отправки. */
+interface OutboundMediaItem {
+  ref: string;
+  mimeType: string;
+  name: string;
+}
+
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  gif: "image/gif",
+  bmp: "image/bmp",
+};
+
+const AUDIO_MIME_BY_EXT: Record<string, string> = {
+  ogg: "audio/ogg",
+  oga: "audio/ogg",
+  opus: "audio/ogg",
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  wav: "audio/wav",
+  aac: "audio/aac",
+};
+
+/**
+ * Собрать вложения ответа: ссылки из нагрузки плюс тип файла.
+ *
+ * Тип берётся из `attachments`, если ядро его сообщило, иначе по расширению.
+ * Дубликаты (ядро кладёт одно и то же и в `mediaUrl`, и в `mediaUrls`) снимаются.
+ */
+export function collectOutboundMedia(payload: DeliverPayload): OutboundMediaItem[] {
+  const refs = [payload?.mediaUrl, ...(Array.isArray(payload?.mediaUrls) ? payload.mediaUrls : [])];
+  const attachments = Array.isArray(payload?.attachments) ? payload.attachments : [];
+  const seen = new Set<string>();
+  const items: OutboundMediaItem[] = [];
+  for (const ref of refs) {
+    if (typeof ref !== "string" || !ref || seen.has(ref)) continue;
+    seen.add(ref);
+    const bare = ref.split("?")[0].split("#")[0];
+    const attachment = attachments.find((a) =>
+      [a?.mediaUrl, a?.url, a?.path, a?.filePath].includes(ref),
+    );
+    const ext = (bare.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? "").toLowerCase();
+    items.push({
+      ref,
+      mimeType: attachment?.mimeType ?? IMAGE_MIME_BY_EXT[ext] ?? AUDIO_MIME_BY_EXT[ext] ?? "",
+      name: safeFileName(bare.split("/").pop() || "file"),
+    });
+  }
+  return items;
+}
+
+/**
+ * Имя файла для загрузчика.
+ *
+ * `decodeURIComponent` бросает `URIError` на одиночном проценте в имени, а
+ * вызов стоит в самом начале доставки — вне защиты вокруг медиа. Такое имя
+ * унесло бы весь ответ, а не одно вложение.
+ */
+function safeFileName(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** Прочитать вложение: локальный файл или ссылка. */
+async function readOutboundMedia(ref: string): Promise<Buffer> {
+  if (/^https?:\/\//i.test(ref)) {
+    const res = await fetch(ref);
+    if (!res.ok) throw new Error(`media fetch failed: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+  const { readFile } = await import("node:fs/promises");
+  return readFile(ref.startsWith("file://") ? new URL(ref) : ref);
+}
+
+export function createStreamingDeliver(
   account: ResolvedMaxAccount,
   chatId: string,
   dialogChatId: string,
   chatType: string,
+  entry: MaxStreamingEntry,
+  mode: MaxProgressDraftMode,
+  seed: string,
   log?: any,
 ): {
   onPartialToken: (text: string) => Promise<void>;
   onWorkStart: () => Promise<void>;
   onThinking: () => Promise<void>;
-  onToolStart: (payload: { name?: string; args?: unknown }) => Promise<void>;
+  onToolStart: (payload: { name?: string; args?: unknown; phase?: string }) => Promise<void>;
   onItemEvent: (payload: {
     title?: string;
     summary?: string;
     progressText?: string;
     name?: string;
+    phase?: string;
   }) => Promise<void>;
   onApprovalEvent: (payload: { phase?: string; title?: string }) => Promise<void>;
-  deliver: (payload: { text?: string; body?: string }) => Promise<void>;
+  deliver: (payload: DeliverPayload, info?: DeliverInfo) => Promise<void>;
   finish: () => Promise<void>;
 } {
-  let messageId: string | null = null;
+  // Живой поток — только при `streaming.mode: "partial"`.
   let accumulated = "";
-  let lastEditAt = 0;
-  let pendingEdit: ReturnType<typeof setTimeout> | null = null;
-  let phase: StreamPhase = "idle";
-  let thinkingNoted = false;
-  const progressLines: string[] = [];
+  // Рассказ по ходу работы (`kind=block`) — копится отдельно от ответа: ядро
+  // отдаёт куски не в том порядке, в каком их ждёшь, и раньше пришедший позже
+  // рассказ затирал готовый ответ.
+  let blockDraft = "";
+  let answerDelivered = false;
 
-  // Typing indicator — declared early so throttledEdit can reference it
+  const draft = createMaxProgressDraft({ account, chatId, chatType, entry, mode, seed, log });
+
+  // Typing indicator — MAX сбрасывает его на каждой правке сообщения.
   const numericDialogChatId = parseInt(dialogChatId, 10);
   let typingInterval: ReturnType<typeof setInterval> | null = null;
   let safetyTimer: ReturnType<typeof setTimeout> | null = null;
   if (!isNaN(numericDialogChatId)) {
+    // Вторая галка у сообщения собеседника: ставится один раз в начале хода.
+    markSeen(account.token, numericDialogChatId).catch(() => {});
     sendTypingAction(account.token, numericDialogChatId).catch(() => {});
     typingInterval = setInterval(() => {
       sendTypingAction(account.token, numericDialogChatId).catch(() => {});
@@ -184,99 +292,108 @@ function createStreamingDeliver(
   // Register so sendMedia can stop ALL active typing intervals
   activeTypingStops.set(instanceKey, stopTyping);
 
-  async function throttledEdit(text: string) {
-    if (!messageId) return;
-    const elapsed = Date.now() - lastEditAt;
-    if (pendingEdit) clearTimeout(pendingEdit);
-    if (elapsed >= STREAM_EDIT_INTERVAL_MS) {
-      await editMessage(account.token, messageId, text);
-      lastEditAt = Date.now();
-      // MAX clears typing on message edit — renew immediately after
-      if (typingInterval !== null) {
-        sendTypingAction(account.token, numericDialogChatId).catch(() => {});
+  function maxTarget(): MaxSendTarget {
+    const numericId = parseInt(chatId, 10);
+    if (isNaN(numericId)) throw new Error(`Invalid MAX chat id: ${chatId}`);
+    return { kind: chatType === "direct" ? "direct" : "chat", id: numericId };
+  }
+
+  /** Картинки вложением; подпись уходит с первой. */
+  async function sendOutboundImages(items: OutboundMediaItem[], caption: string) {
+    const target = maxTarget();
+    let text = caption;
+    for (const item of items) {
+      const buffer = await readOutboundMedia(item.ref);
+      const uploadUrl = await getUploadUrl(account.token, "image");
+      if (!uploadUrl) throw new Error("Failed to get MAX upload URL");
+      const uploaded = await uploadFile(uploadUrl, buffer, item.mimeType || "image/jpeg", item.name);
+      if (!uploaded) throw new Error("Failed to upload image to MAX");
+      const mid =
+        target.kind === "direct"
+          ? await sendDmWithImage(account.token, target.id, text, uploaded.token)
+          : await sendToChatWithImage(account.token, target.id, text, uploaded.token);
+      // Отправка картинки глотает ошибку API и отдаёт null. Без этой проверки
+      // в лог уходило бодрое «image sent mid=unknown», то есть датчик, ради
+      // которого лог и заводили, на провале молчал.
+      if (!mid) throw new Error("Failed to send MAX image");
+      log?.info?.(`[openclaw-max] image sent mid=${mid} bytes=${buffer.length}`);
+      text = "";
+    }
+  }
+
+  /** Звук вложением: токен от `createUpload`, отправка с ожиданием обработки. */
+  async function sendOutboundAudio(items: OutboundMediaItem[], caption: string) {
+    const target = maxTarget();
+    let text = caption;
+    for (const item of items) {
+      const buffer = await readOutboundMedia(item.ref);
+      const upload = await createUpload(account.token, "audio");
+      if (!upload) throw new Error("Failed to create MAX audio upload");
+      const stored = await uploadToUrl(upload.url, buffer, item.mimeType || "audio/ogg", item.name);
+      if (!stored) throw new Error("Failed to upload audio to MAX");
+      const mid = await sendWithAttachment(account.token, target, text, {
+        type: "audio",
+        payload: { token: stored.token ?? upload.token },
+      });
+      log?.info?.(`[openclaw-max] audio sent mid=${mid ?? "unknown"} bytes=${buffer.length}`);
+      text = "";
+    }
+  }
+
+  /**
+   * Отправить вложения ответа. Сбой не роняет ход: текст важнее вложения,
+   * а строка в логе — единственный датчик (раньше медиа терялось молча).
+   */
+  async function sendOutboundMedia(
+    images: OutboundMediaItem[],
+    audios: OutboundMediaItem[],
+    caption: string,
+  ): Promise<boolean> {
+    try {
+      if (images.length > 0) {
+        await sendOutboundImages(images, caption);
+        caption = "";
       }
-    } else {
-      pendingEdit = setTimeout(async () => {
-        if (messageId) {
-          await editMessage(account.token, messageId, text).catch(() => {});
-          lastEditAt = Date.now();
-          if (typingInterval !== null) {
-            sendTypingAction(account.token, numericDialogChatId).catch(() => {});
-          }
-        }
-      }, STREAM_EDIT_INTERVAL_MS - elapsed) as unknown as ReturnType<typeof setTimeout>;
+      if (audios.length > 0) await sendOutboundAudio(audios, caption);
+      return true;
+    } catch (err) {
+      log?.error?.(
+        `[openclaw-max] вложение отправить не удалось: ${err instanceof Error ? err.message : err}`,
+      );
+      return false;
     }
   }
 
-  // Promise to prevent race condition on first message creation
-  let creationPromise: Promise<void> | null = null;
+  let placeholderShown = false;
 
-  async function ensureVisible(text: string) {
-    if (!text) return;
-    if (!creationPromise) {
-      creationPromise = (async () => {
-        messageId = await sendReply(account, chatId, chatType, text);
-        lastEditAt = Date.now();
-        log?.info?.(`[openclaw-max] Activity message mid=${messageId}`);
-      })();
-      await creationPromise;
-      return;
-    }
-    await creationPromise;
-    await throttledEdit(text);
-  }
-
-  function renderStatus(): string {
-    const lines = [PLACEHOLDER_TEXT, ...progressLines.slice(-STATUS_MAX_LINES)];
-    return lines.join("\n");
-  }
-
-  async function showStatus() {
-    if (phase === "streaming" || phase === "done") return;
-    phase = "status";
-    armTypingSafety();
-    await ensureVisible(renderStatus());
-  }
-
-  let placeholderTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-    if (phase === "idle") showStatus().catch(() => {});
-  }, PLACEHOLDER_DELAY_MS);
-
-  function cancelPlaceholderTimer() {
-    if (placeholderTimer) {
-      clearTimeout(placeholderTimer);
-      placeholderTimer = null;
-    }
-  }
-
+  /**
+   * Ход начался: показать метку, пока шагов ещё нет.
+   *
+   * Ядро зовёт это не раз за ход, а каждые несколько секунд, пока держит
+   * индикатор набора. Раньше каждый тик переписывал черновик мимо компоновщика
+   * и затирал уже нарисованный список шагов одной меткой.
+   */
   async function onWorkStart() {
-    cancelPlaceholderTimer();
-    if (phase === "idle" || phase === "status") await showStatus();
-  }
-
-  async function pushProgressLine(line: string) {
-    const cleaned = truncateStatus(line);
-    if (!cleaned) return;
-    if (progressLines[progressLines.length - 1] === cleaned) return;
-    progressLines.push(cleaned);
-    if (progressLines.length > STATUS_MAX_LINES) progressLines.shift();
-    await showStatus();
+    armTypingSafety();
+    if (placeholderShown) return;
+    placeholderShown = true;
+    await draft.showPlaceholder();
   }
 
   async function onThinking() {
-    if (thinkingNoted) return;
-    thinkingNoted = true;
-    await pushProgressLine("💭 думаю…");
+    armTypingSafety();
+    await draft.compositor.pushReasoningProgress("думаю…");
   }
 
-  async function onToolStart(payload: { name?: string; args?: unknown }) {
+  async function onToolStart(payload: { name?: string; args?: unknown; phase?: string }) {
     const name = typeof payload?.name === "string" ? payload.name.trim() : "";
     if (!name) return;
-    const hint = shortToolHint(payload?.args);
-    const line = hint
-      ? `${toolStatusIcon(name)} ${name}: ${hint}`
-      : `${toolStatusIcon(name)} ${name}`;
-    await pushProgressLine(line);
+    armTypingSafety();
+    await draft.compositor.pushToolEvent({
+      name,
+      phase: payload?.phase,
+      args: (payload?.args ?? undefined) as Record<string, unknown> | undefined,
+    });
   }
 
   async function onItemEvent(payload: {
@@ -284,94 +401,167 @@ function createStreamingDeliver(
     summary?: string;
     progressText?: string;
     name?: string;
+    phase?: string;
   }) {
-    const title = typeof payload?.title === "string" ? payload.title.trim() : "";
-    const summary = typeof payload?.summary === "string" ? payload.summary.trim() : "";
-    const progressText = typeof payload?.progressText === "string" ? payload.progressText.trim() : "";
-    const name = typeof payload?.name === "string" ? payload.name.trim() : "";
-    const detail = title || summary || progressText;
-    if (!detail) return;
-    const label = title || name || "шаг";
-    const extra = summary && summary !== title ? summary : (!title && progressText ? progressText : "");
-    await pushProgressLine(
-      extra
-        ? `${toolStatusIcon(name)} ${label}: ${truncateStatus(extra, 80)}`
-        : `${toolStatusIcon(name)} ${label}`,
-    );
+    armTypingSafety();
+    await draft.compositor.pushItemEvent({
+      title: payload?.title,
+      summary: payload?.summary,
+      progressText: payload?.progressText,
+      name: payload?.name,
+      phase: payload?.phase,
+    });
   }
 
   async function onApprovalEvent(payload: { phase?: string; title?: string }) {
     if (payload?.phase && payload.phase !== "requested") return;
-    const title = typeof payload?.title === "string" ? payload.title.trim() : "";
-    await pushProgressLine(
-      title ? `⏳ жду подтверждение: ${truncateStatus(title, 80)}` : "⏳ жду подтверждение…",
-    );
+    armTypingSafety();
+    await draft.compositor.pushApprovalEvent({ phase: payload?.phase, title: payload?.title });
   }
 
-  // Called for each streaming partial (text is CUMULATIVE — full text so far)
+  /** Живой поток текста — только при `streaming.mode: "partial"`. */
   async function onPartialToken(text: string) {
     if (!text) return;
-    cancelPlaceholderTimer();
-    phase = "streaming";
     armTypingSafety();
-    // Keep typing indicator alive during streaming — stop only in deliver()
     accumulated = text; // SET not += (onPartialReply is cumulative)
-    await ensureVisible(accumulated + " …");
+    await draft.overwrite(`${accumulated} …`);
   }
 
-  // Called once at end with final authoritative text
-  async function deliver(payload: { text?: string; body?: string }) {
-    cancelPlaceholderTimer();
-    stopTyping(); // Ensure typing stops even if no partial tokens came
-    if (pendingEdit) {
-      clearTimeout(pendingEdit);
-      pendingEdit = null;
-    }
-    const rawText = payload?.text ?? payload?.body ?? accumulated;
-    if (isSilentFinalText(rawText) && !accumulated) {
-      if (messageId && (phase === "status" || phase === "idle")) {
-        await deleteMessage(account.token, messageId);
-        messageId = null;
-        phase = "done";
+  /** Отдать ответ: переписать черновик на месте либо послать новым сообщением. */
+  async function publishAnswer(text: string): Promise<void> {
+    const draftId = draft.currentMessageId();
+    draft.compositor.markFinalReplyStarted();
+    if (draftId) {
+      // Черновик становится ответом — без метки и без списка шагов.
+      const ok = await editMessage(account.token, draftId, text);
+      if (ok) {
+        // Забываем сообщение: оно больше не черновик, а ответ. Иначе поздний
+        // приход уведёт его в `remove()` — так в ВК исчез текст у собеседника.
+        draft.detach();
+        answerDelivered = true;
+        log?.info?.(`[openclaw-max] answer in draft mid=${draftId} chars=${text.length}`);
+        return;
       }
+      draft.close();
+      // Правка не прошла (окно закрылось, сообщение удалили) — шлём заново.
+      await draft.remove();
+    } else {
+      draft.close();
+    }
+    const mid = await sendReply(account, chatId, chatType, text);
+    answerDelivered = true;
+    log?.info?.(`[openclaw-max] answer sent mid=${mid ?? "unknown"} chars=${text.length}`);
+  }
+
+  /**
+   * Один кусок ответа от ядра.
+   *
+   * `info.kind` отличает промежуточный рассказ (`block`) от ответа (`final`).
+   * Без него плагин писал в одно сообщение и то и другое: рассказ приходил
+   * после готового ответа и затирал его (лог 22.09.2026, ход 13:18 — 171
+   * символ «Посмотрю, есть ли датчик…» поверх 687 символов ответа).
+   *
+   * Финал с `visibleTextAlreadyDelivered` — не ответ, а голос к уже показанному
+   * тексту: трогать текст ему нельзя. В ВК пропуск этой проверки 08.09.2026
+   * удалил сообщение с ответом.
+   */
+  async function deliver(payload: DeliverPayload, info?: DeliverInfo) {
+    // В черновик уходит только рассказ по ходу работы. Всё прочее (`final`,
+    // долговечные результаты инструментов, неизвестные виды) доставляется:
+    // спрятать в черновик, скажем, запрос подтверждения — значит отчитаться
+    // ядру о доставке и не показать вопрос собеседнику.
+    const isFinal = (info?.kind ?? "final") !== "block";
+    const isTtsSupplement =
+      isFinal && payload?.ttsSupplement?.visibleTextAlreadyDelivered === true;
+    const rawText = payload?.text ?? payload?.body ?? accumulated;
+    const media = collectOutboundMedia(payload);
+    const images = media.filter((item) => item.mimeType.startsWith("image/"));
+    const audios = media.filter((item) => item.mimeType.startsWith("audio/"));
+    for (const item of media) {
+      if (!images.includes(item) && !audios.includes(item)) {
+        log?.info?.(
+          `[openclaw-max] вложение пропущено, MAX принимает картинку и звук: ${item.name} (${item.mimeType || "тип неизвестен"})`,
+        );
+      }
+    }
+    const hasMedia = images.length > 0 || audios.length > 0;
+
+    // ── Промежуточный кусок: в черновик хода, не в ответ ────────────────────
+    if (!isFinal) {
+      const chunk = String(rawText ?? "").trim();
+      if (chunk && !isSilentFinalText(chunk)) {
+        blockDraft = blockDraft ? `${blockDraft}\n\n${chunk}` : chunk;
+        await draft.compositor.pushNarrationProgress(chunk);
+      }
+      // Вложение в черновик не положить — отправляем сразу, отдельным сообщением.
+      if (hasMedia) await sendOutboundMedia(images, audios, "");
       return;
     }
-    const finalText = isSilentFinalText(rawText) ? accumulated : rawText;
-    if (!finalText) return;
-    phase = "done";
-    if (messageId) {
-      // Edit existing streamed/status message — remove cursor, use final text
-      await editMessage(account.token, messageId, finalText);
+
+    stopTyping(); // Ensure typing stops even if no partial tokens came
+
+    // ── Голосовой довесок: несёт только звук, текст уже показан ─────────────
+    if (isTtsSupplement) {
+      // «Уже показан» — со стороны ядра. У нас куски `block` только копятся в
+      // черновике и наружу не уходят, поэтому при озвучке финала собеседник
+      // получил бы голос и ни строчки текста, а `finish` ещё и стёр бы черновик.
+      if (!answerDelivered) {
+        const spoken = payload?.ttsSupplement?.spokenText ?? "";
+        const text = blockDraft || String(rawText ?? "") || spoken;
+        if (text.trim()) await publishAnswer(text);
+      }
+      await sendOutboundMedia(images, audios, "");
+      return;
+    }
+
+    // Пустой финал: ответом становится то, что успело прийти кусками.
+    const finalText = isSilentFinalText(rawText) ? accumulated || blockDraft : rawText;
+    if (!finalText && !hasMedia) {
+      // Отвечать нечем — черновик убираем, чтобы не висел «работаю».
+      draft.close();
+      await draft.remove();
+      return;
+    }
+    if (finalText) {
+      await publishAnswer(finalText);
     } else {
-      // No partial tokens came through — send fresh
-      await sendReply(account, chatId, chatType, finalText);
+      // Одно вложение без текста: черновик не нужен.
+      draft.close();
+      await draft.remove();
+    }
+    if (hasMedia) {
+      // Текст уже ушёл сообщением — подпись только если его не было.
+      // Текст ушёл своим сообщением, поэтому подписи у вложения нет.
+      await sendOutboundMedia(images, audios, "");
     }
   }
 
   async function finish() {
-    cancelPlaceholderTimer();
     stopTyping();
-    if (pendingEdit) {
-      clearTimeout(pendingEdit);
-      pendingEdit = null;
-    }
-    if (messageId && (phase === "status" || phase === "idle")) {
-      await deleteMessage(account.token, messageId).catch(() => {});
-      messageId = null;
-      phase = "done";
-    } else if (phase === "streaming" && messageId && accumulated) {
-      await editMessage(account.token, messageId, accumulated).catch(() => {});
-      phase = "done";
+    draft.compositor.markFinalReplyDelivered();
+    draft.close();
+    if (!answerDelivered) {
+      // Ход кончился, а ответа не было: черновик остался бы висеть навсегда.
+      await draft.remove();
     }
   }
 
-  return { onPartialToken, onWorkStart, onThinking, onToolStart, onItemEvent, onApprovalEvent, deliver, finish };
+  return {
+    onPartialToken,
+    onWorkStart,
+    onThinking,
+    onToolStart,
+    onItemEvent,
+    onApprovalEvent,
+    deliver,
+    finish,
+  };
 }
 
 /**
  * Dispatch an inbound message to the OpenClaw agent and send reply back.
  */
-async function deliverMessage(
+export async function deliverMessage(
   {
     text,
     senderId,
@@ -426,8 +616,24 @@ async function deliverMessage(
     CommandAuthorized: true,
   });
 
+  // Черновик хода ведётся по общим для каналов настройкам `channels.max.streaming`.
+  // Умолчание — "progress", как у Telegram и ВК: шаги живут в одном сообщении,
+  // посимвольный поток не подписывается вовсе (именно он затирал черновик).
+  const entry = (cfg as { channels?: Record<string, unknown> } | undefined)?.channels?.[
+    CHANNEL_ID
+  ] as MaxStreamingEntry;
+  const streamMode = resolveChannelPreviewStreamMode(entry, "progress") as MaxProgressDraftMode;
   const { onPartialToken, onWorkStart, onThinking, onToolStart, onItemEvent, onApprovalEvent, deliver, finish } =
-    createStreamingDeliver(account, chatId, dialogChatId, chatType, log);
+    createStreamingDeliver(
+      account,
+      chatId,
+      dialogChatId,
+      chatType,
+      entry,
+      streamMode,
+      `${chatId}:${_messageId}`,
+      log,
+    );
 
   try {
     await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -435,17 +641,33 @@ async function deliverMessage(
       cfg,
       dispatcherOptions: {
         deliver,
-        onReplyStart: () => {
-          log?.info?.(`[openclaw-max] Agent reply started for ${senderName}`);
-          return onWorkStart();
-        },
+        // Ядро зовёт `onReplyStart` не раз за ход, а каждые ~5 секунд, пока
+        // идёт работа: в логе выходило 27 строк на два сообщения за час.
+        // Плашку обновляем как прежде, а пишем один раз.
+        onReplyStart: (() => {
+          let announced = false;
+          return () => {
+            if (!announced) {
+              announced = true;
+              log?.info?.(`[openclaw-max] Agent reply started for ${senderName}`);
+            }
+            return onWorkStart();
+          };
+        })(),
       },
       replyOptions: {
         suppressDefaultToolProgressMessages: true,
         preserveProgressCallbackStartOrder: true,
-        onPartialReply: async (payload: { text?: string }) => {
-          if (payload?.text) await onPartialToken(payload.text);
-        },
+        // Посимвольный поток подписывается только при `streaming.mode: "partial"`.
+        // В режимах "progress"/"block" он затирал бы черновик хода — из-за него
+        // статус пропадал на середине хода (лог 22.09.2026, ход 13:18).
+        ...(streamMode === "partial"
+          ? {
+              onPartialReply: async (payload: { text?: string }) => {
+                if (payload?.text) await onPartialToken(payload.text);
+              },
+            }
+          : {}),
         onReasoningStream: async () => {
           await onThinking();
         },
@@ -507,6 +729,11 @@ export function createMaxPlugin(): any {
 
     configSchema: MaxConfigSchema,
 
+    secrets: {
+      secretTargetRegistryEntries,
+      collectRuntimeConfigAssignments,
+    },
+
     config: {
       listAccountIds: (cfg: any) => listAccountIds(cfg),
       resolveAccount: (cfg: any, accountId?: string | null) => resolveAccount(cfg, accountId),
@@ -531,7 +758,10 @@ export function createMaxPlugin(): any {
 
     pairing: {
       idLabel: "maxUserId",
-      normalizeAllowEntry: (entry: string) => entry.replace(/^max:(?:user:)?/i, "").trim(),
+      // Сначала обрезка, потом префикс: запись с ведущим пробелом
+      // (« max:user:42») иначе остаётся с префиксом и не совпадает с
+      // отправителем. В `normalizeAllowFrom` порядок как раз правильный.
+      normalizeAllowEntry: (entry: string) => entry.trim().replace(/^max:(?:user:)?/i, "").trim(),
       notifyApproval: async ({ cfg, id }: { cfg: any; id: string }) => {
         const account = resolveAccount(cfg);
         if (!account.token) return;
@@ -567,7 +797,7 @@ export function createMaxPlugin(): any {
 
       sendText: async ({ to, text, accountId, cfg }: any) => {
         const account = resolveAccount(cfg ?? {}, accountId);
-        if (!account.token) throw new Error("MAX token not configured");
+        if (!account.token) throw new Error(describeMissingToken(account));
 
         const numericId = parseInt(to.replace(/^max:(?:user:)?/i, ""), 10);
         if (isNaN(numericId)) throw new Error(`Invalid MAX user ID: ${to}`);
@@ -579,7 +809,7 @@ export function createMaxPlugin(): any {
 
       sendMedia: async ({ to, buffer, mimeType, filename, caption, accountId, cfg, chatType }: any) => {
         const account = resolveAccount(cfg ?? {}, accountId);
-        if (!account.token) throw new Error("MAX token not configured");
+        if (!account.token) throw new Error(describeMissingToken(account));
 
         const numericId = parseInt(to.replace(/^max:(?:user:)?/i, ""), 10);
         if (isNaN(numericId)) throw new Error(`Invalid MAX user ID: ${to}`);
@@ -590,28 +820,44 @@ export function createMaxPlugin(): any {
           : mimeType?.startsWith("audio/") ? "audio"
           : "file";
 
-        // Get upload URL
-        const uploadUrl = await getUploadUrl(account.token, mediaType as "image" | "video" | "audio" | "file");
-        if (!uploadUrl) throw new Error("Failed to get MAX upload URL");
-
-        // Upload file
-        const uploaded = await uploadFile(uploadUrl, buffer, mimeType ?? "application/octet-stream", filename ?? "file");
-        if (!uploaded) throw new Error("Failed to upload file to MAX");
-
-        // Send message with attachment
         const text = caption ?? "";
         let mid: string | null = null;
         if (mediaType === "image") {
+          // Для картинки токен вложения отдаёт сам загрузчик.
+          const uploadUrl = await getUploadUrl(account.token, "image");
+          if (!uploadUrl) throw new Error("Failed to get MAX upload URL");
+          const uploaded = await uploadFile(
+            uploadUrl,
+            buffer,
+            mimeType ?? "application/octet-stream",
+            filename ?? "file",
+          );
+          if (!uploaded) throw new Error("Failed to upload file to MAX");
           if (chatType === "direct" || !chatType) {
             mid = await sendDmWithImage(account.token, numericId, text, uploaded.token);
           } else {
             mid = await sendToChatWithImage(account.token, numericId, text, uploaded.token);
           }
         } else {
-          // For non-image media, fall back to text with caption
-          if (text) {
-            mid = await sendDm(account.token, numericId, text);
-          }
+          // Всё остальное MAX тоже принимает вложением (audio, video, file), но
+          // токен берётся у `POST /uploads`, а не у загрузчика, и сразу после
+          // загрузки приходит `attachment.not.ready`. Раньше здесь был откат в
+          // текст с подписью: голос и документы до собеседника не доходили.
+          const upload = await createUpload(account.token, mediaType);
+          if (!upload) throw new Error("Failed to create MAX upload");
+          const stored = await uploadToUrl(
+            upload.url,
+            buffer,
+            mimeType ?? "application/octet-stream",
+            filename ?? "file",
+          );
+          if (!stored) throw new Error("Failed to upload file to MAX");
+          mid = await sendWithAttachment(
+            account.token,
+            { kind: chatType === "direct" || !chatType ? "direct" : "chat", id: numericId },
+            text,
+            { type: mediaType, payload: { token: stored.token ?? upload.token } },
+          );
         }
 
         // Stop ALL active typing indicators — deliver() may not be called after sendMedia
@@ -629,6 +875,11 @@ export function createMaxPlugin(): any {
 
         if (!account.enabled) {
           log?.info?.(`[openclaw-max] Account ${accountId} disabled, skipping`);
+          return waitUntilAbort(ctx.abortSignal);
+        }
+
+        if (account.tokenUnresolved) {
+          log?.error?.(`[openclaw-max] Account ${accountId}: ${describeMissingToken(account)}, not starting`);
           return waitUntilAbort(ctx.abortSignal);
         }
 
@@ -711,7 +962,7 @@ async function startWebhookMode(ctx: any, account: ResolvedMaxAccount, _cfg: unk
 
   const handler = createWebhookHandler({
     account,
-    deliver: async (msg) => {
+    deliver: async (msg: InboundDelivery) => {
       const currentCfg = _cfg;
       await deliverMessage(msg, account, currentCfg, log);
       return null;
@@ -774,7 +1025,7 @@ async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg:
           await handleUpdate(
             update,
             account,
-            async (msg) => {
+            async (msg: InboundDelivery) => {
               await deliverMessage(msg, account, currentCfg, log);
               return null;
             },

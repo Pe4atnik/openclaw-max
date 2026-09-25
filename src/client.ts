@@ -165,6 +165,22 @@ export async function sendTypingAction(
 }
 
 /**
+ * Отметить переписку прочитанной — вторая галка у сообщения собеседника.
+ *
+ * ⚠️ Действия `mark_seen` нет в документации (там перечислены `typing_on` и
+ * четыре `sending_*`), но API его принимает: проверено живой отправкой
+ * 22.09.2026 — `200 {"success":true}`. Без него сообщения собеседника
+ * навсегда остаются с одной галкой, будто бот их не читал.
+ */
+export async function markSeen(token: string, chatId: number): Promise<void> {
+  try {
+    await maxRequest(token, "POST", `/chats/${chatId}/actions`, {}, { action: "mark_seen" });
+  } catch {
+    // Отметка о прочтении — вежливость, а не доставка: молчим на сбое.
+  }
+}
+
+/**
  * Long-poll for new updates.
  * Returns updates + next marker.
  */
@@ -332,4 +348,106 @@ export async function sendToChatWithImage(token: string, chatId: number, text: s
     console.warn(`[openclaw-max] sendToChatWithImage error: ${err instanceof Error ? err.message : err}`);
     return null;
   }
+}
+
+// ─── Вложения общего вида (аудио, видео, файлы) ──────────────────────────────
+//
+// Картинка грузится иначе всего остального, и одними `getUploadUrl` +
+// `uploadFile` звук отправить нельзя (проверено живой отправкой 22.09.2026):
+//
+//  • токен вложения отдаёт ответ `POST /uploads` (поля `url` и `token`), а НЕ
+//    ответ загрузчика: для аудио тот возвращает `<retval>1</retval>`, и разбор
+//    JSON в `uploadFile` считает удачную загрузку провалом;
+//  • сразу после загрузки MAX какое-то время отвечает `attachment.not.ready` —
+//    отправку надо переждать и повторить;
+//  • OGG/Opus принимается, хотя в документации перечислены MP3, WAV и M4A.
+
+/** Куда грузить файл и каким токеном потом сослаться на него во вложении. */
+export interface MaxUploadTarget {
+  url: string;
+  token: string;
+}
+
+/**
+ * Создать загрузку: вернуть URL загрузчика ВМЕСТЕ с токеном вложения.
+ * Для картинок токен приезжает от самого загрузчика, для остальных типов — отсюда.
+ */
+export async function createUpload(
+  token: string,
+  type: "image" | "video" | "audio" | "file",
+): Promise<MaxUploadTarget | null> {
+  try {
+    const res = await maxRequest<Partial<MaxUploadTarget>>(token, "POST", "/uploads", { type });
+    return res?.url && res?.token ? { url: res.url, token: res.token } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Загрузить файл по URL загрузчика.
+ * Возвращает токен, если загрузчик его дал, иначе `{ token: null }` — это НЕ ошибка:
+ * загрузчик аудио отвечает `<retval>1</retval>`, а токен берётся у `createUpload`.
+ */
+export async function uploadToUrl(
+  uploadUrl: string,
+  buffer: Buffer,
+  mimeType: string,
+  filename: string,
+): Promise<{ token: string | null } | null> {
+  try {
+    const form = new FormData();
+    form.append("data", new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
+    const res = await fetch(uploadUrl, { method: "POST", body: form, dispatcher });
+    if (!res.ok) return null;
+    const text = await res.text();
+    try {
+      const json = JSON.parse(text) as { token?: unknown };
+      return { token: typeof json?.token === "string" ? json.token : null };
+    } catch {
+      return { token: null };
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** Кому шлём: личка (`user_id`) или чат (`chat_id`). */
+export interface MaxSendTarget {
+  kind: "direct" | "chat";
+  id: number;
+}
+
+/**
+ * Отправить сообщение со вложением, пережидая обработку файла на стороне MAX.
+ *
+ * `attachment.not.ready` — единственная ошибка, которую имеет смысл ждать:
+ * файл загружен, но ещё обрабатывается. Остальные пробрасываются сразу.
+ */
+export async function sendWithAttachment(
+  token: string,
+  target: MaxSendTarget,
+  text: string,
+  attachment: { type: string; payload: { token: string } },
+  waitsMs: readonly number[] = [0, 1500, 3000, 4500, 6000, 9000],
+): Promise<string | null> {
+  const params: Record<string, string | number> =
+    target.kind === "direct" ? { user_id: target.id } : { chat_id: target.id };
+  const body: Record<string, unknown> = { attachments: [attachment] };
+  if (text) body.text = text;
+  let lastError: unknown = null;
+  for (const wait of waitsMs) {
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      const res = await maxRequest<{ message?: { body?: { mid?: string } } }>(
+        token, "POST", "/messages", params, body
+      );
+      return res?.message?.body?.mid ?? null;
+    } catch (err) {
+      lastError = err;
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes("attachment.not.ready")) throw err;
+    }
+  }
+  throw lastError ?? new Error("MAX attachment never became ready");
 }

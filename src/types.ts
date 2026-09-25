@@ -3,12 +3,49 @@
  * https://dev.max.ru/docs-api
  */
 
+// ─── Inbound delivery ─────────────────────────────────────────────────────────
+
+/** One inbound image, already downloaded and base64-encoded for the agent. */
+export interface InboundImage {
+  data: string;
+  mimeType: string;
+}
+
+/**
+ * What the webhook/polling handler hands to the channel for one inbound message.
+ *
+ * `webhook-handler.ts` is a compiled copy carrying `@ts-nocheck`, so the shape is
+ * declared here instead: `channel.ts` imported `InboundImage` from that module,
+ * which never exported it, and the build reported the error on every run.
+ */
+export interface InboundDelivery {
+  text: string;
+  senderId: string;
+  senderName: string;
+  chatId: string;
+  dialogChatId: string;
+  chatType: string;
+  messageId: string;
+  accountId: string;
+  images?: InboundImage[];
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
+
+/** Reference to a secret the host resolves before the plugin reads the config. */
+export interface MaxSecretRef {
+  source: string;
+  provider?: string;
+  id?: string;
+}
+
+/** Plain token or a SecretRef to it. */
+export type MaxTokenInput = string | MaxSecretRef;
 
 export interface MaxAccountConfig {
   enabled?: boolean;
-  /** Bot token from MAX Partner Platform */
-  token?: string;
+  /** Bot token from MAX Partner Platform, or a SecretRef to it */
+  token?: MaxTokenInput;
   /**
    * Public HTTPS URL for webhook delivery (e.g. https://yourdomain.com/max/webhook).
    * If omitted, the plugin falls back to long polling.
@@ -35,7 +72,10 @@ export interface MaxConfig extends MaxAccountConfig {
 
 export interface ResolvedMaxAccount {
   accountId: string;
+  /** Empty when the token is missing or its SecretRef was not resolved. */
   token: string;
+  /** `source:provider:id` of a SecretRef the host left unresolved. */
+  tokenUnresolved?: string;
   enabled: boolean;
   webhookUrl?: string;
   webhookSecret?: string;

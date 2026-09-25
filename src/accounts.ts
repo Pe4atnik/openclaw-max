@@ -2,7 +2,7 @@
  * Account config resolution for the MAX channel plugin.
  */
 
-import type { MaxConfig, ResolvedMaxAccount } from "./types.js";
+import type { MaxConfig, MaxTokenInput, ResolvedMaxAccount } from "./types.js";
 
 export const DEFAULT_ACCOUNT_ID = "default";
 export const DEFAULT_WEBHOOK_PATH = "/max/webhook";
@@ -35,9 +35,12 @@ export function resolveAccount(
   // Merge: per-account overrides root-level
   const merged = { ...maxCfg, ...perAccount };
 
+  const { token, tokenUnresolved } = readToken(merged.token);
+
   return {
     accountId: id,
-    token: (merged.token ?? "").trim(),
+    token,
+    ...(tokenUnresolved ? { tokenUnresolved } : {}),
     enabled: merged.enabled !== false,
     webhookUrl: merged.webhookUrl,
     webhookSecret: merged.webhookSecret,
@@ -46,6 +49,28 @@ export function resolveAccount(
     allowFrom: normalizeAllowFrom(merged.allowFrom),
     httpProxy: merged.httpProxy?.trim() || undefined,
   };
+}
+
+/**
+ * The host resolves a SecretRef token before the plugin sees the config. When it
+ * cannot (provider down, id missing), it leaves the reference object in place and
+ * marks the account unavailable; everything here must survive that object instead
+ * of calling `.trim()` on it.
+ */
+function readToken(raw: MaxTokenInput | undefined): { token: string; tokenUnresolved?: string } {
+  if (raw === undefined || raw === null) return { token: "" };
+  if (typeof raw === "string") return { token: raw.trim() };
+  if (typeof raw === "object" && typeof raw.source === "string") {
+    return { token: "", tokenUnresolved: `${raw.source}:${raw.provider ?? "?"}:${raw.id ?? "?"}` };
+  }
+  return { token: "", tokenUnresolved: "value is not a string" };
+}
+
+/** Why an account has no usable token, for logs and send errors. */
+export function describeMissingToken(account: Pick<ResolvedMaxAccount, "tokenUnresolved">): string {
+  return account.tokenUnresolved
+    ? `MAX token SecretRef ${account.tokenUnresolved} is not resolved (check the secrets provider: openclaw secrets audit)`
+    : "MAX token not configured";
 }
 
 function normalizeAllowFrom(raw?: string[]): string[] {
