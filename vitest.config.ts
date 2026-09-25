@@ -2,9 +2,6 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // The reconnect suite uses node:test and is run separately by
-    // `npm run test:reconnect`; Vitest must not treat it as an empty suite.
-    exclude: ["test/**", "node_modules/**", "dist/**"],
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts"],
@@ -25,13 +22,10 @@ export default defineConfig({
       // осознанно: часть из них — защитные `?.` на путях, которые ядро не
       // проходит, и выдумывать под них сценарии значит писать тесты ради цифры.
       thresholds: {
-        // Current OpenClaw mediaUrl compatibility adds guarded fallback
-        // branches that are covered by focused tests but not every defensive
-        // error path. Keep the gate above the measured baseline.
-        statements: 97,
-        lines: 97,
+        statements: 98,
+        lines: 98,
         functions: 95,
-        branches: 85,
+        branches: 87,
       },
     },
   },
