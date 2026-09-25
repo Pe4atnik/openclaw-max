@@ -26,7 +26,9 @@ export function isAbortError(error: unknown): boolean {
 export function isRetryableError(error: unknown): boolean {
   const status = (error as { status?: unknown } | null)?.status;
   if (typeof status === "number") return status === 429 || status >= 500;
-  if (isAbortError(error)) return false;
+  // Request-local timeouts surface as AbortError/TimeoutError. A caller's
+  // AbortSignal is checked separately before retrying.
+  if (isAbortError(error) || (error as { name?: unknown } | null)?.name === "TimeoutError") return true;
   if (error instanceof TypeError) return true;
   const code = (error as { code?: unknown; cause?: { code?: unknown } } | null)?.code
     ?? (error as { cause?: { code?: unknown } } | null)?.cause?.code;
@@ -76,7 +78,7 @@ export async function retryWithBackoff<T>(operation: () => Promise<T>, options: 
     try {
       return await operation();
     } catch (error) {
-      if (options.signal?.aborted || isAbortError(error)) throw error;
+      if (options.signal?.aborted) throw error;
       if (!options.isRetryable(error)) throw error;
       consecutiveErrors += 1;
       const delayMs = backoffDelay(
@@ -108,7 +110,7 @@ export async function runResilientPolling<T>(options: PollingOptions<T>): Promis
         options.onConnectionRestored?.();
       }
     } catch (error) {
-      if (options.signal?.aborted || isAbortError(error)) break;
+      if (options.signal?.aborted) break;
       if (!options.isRetryable(error)) throw error;
       consecutiveErrors += 1;
       if (!disconnected) {

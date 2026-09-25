@@ -27,6 +27,21 @@ test("startup verification retries a transient failure then succeeds", async () 
   assert.deepEqual(retries, [1]);
 });
 
+test("startup verification retries a request timeout", async () => {
+  let calls = 0;
+  const result = await retryWithBackoff(async () => {
+    calls += 1;
+    if (calls === 1) {
+      const error = new Error("timed out");
+      error.name = "AbortError";
+      throw error;
+    }
+    return "ok";
+  }, { isRetryable: isRetryableError, sleep: immediate });
+  assert.equal(result, "ok");
+  assert.equal(calls, 2);
+});
+
 test("startup verification does not retry permanent auth failures", async () => {
   let calls = 0;
   await assert.rejects(retryWithBackoff(async () => {
