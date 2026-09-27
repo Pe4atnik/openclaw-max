@@ -360,7 +360,7 @@ describe("запуск канала", () => {
   });
 
   it("неразрешённая ссылка на токен: внятная ошибка, в API не ходим", async () => {
-    const ref = { source: "exec", provider: "openclaw-keychain", id: "max-bot-token" };
+    const ref = { source: "exec", provider: "vault", id: "max/bot-token" };
     const ctl = abortable();
     const started = plugin.gateway.startAccount({
       cfg: { channels: { max: { token: ref } } },
@@ -371,7 +371,7 @@ describe("запуск канала", () => {
     ctl.abort();
     await started;
 
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("SecretRef exec:openclaw-keychain:max-bot-token is not resolved"));
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("SecretRef exec:vault:max/bot-token is not resolved"));
     expect(client.getBotInfo).not.toHaveBeenCalled();
     expect(client.configureMaxTransport).not.toHaveBeenCalled();
 

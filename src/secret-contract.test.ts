@@ -38,7 +38,7 @@ vi.mock("openclaw/plugin-sdk/account-id", () => ({
 const contract = await import("./secret-contract.js");
 const api = await import("../secret-contract-api.js");
 
-const ref = { source: "exec", provider: "openclaw-keychain", id: "max-bot-token" };
+const ref = { source: "exec", provider: "vault", id: "max/bot-token" };
 const context = {} as never;
 const collect = (max: unknown) =>
   contract.collectRuntimeConfigAssignments({ config: { channels: { max } }, context });
