@@ -143,6 +143,12 @@ resolver (canonical keys) instead of a flat `max:<senderId>`.
 
 ## Webhook mode (optional)
 
+Long polling processes updates in order and retries a failed update up to three
+times before leaving the batch marker unchanged. A later poll can therefore
+redeliver the batch. This favors no loss, but an update completed before the
+failure can be delivered more than once; handlers should remain idempotent where
+possible.
+
 For production, configure a webhook instead of long polling:
 
 ```json5
