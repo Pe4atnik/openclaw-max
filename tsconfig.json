@@ -19,6 +19,6 @@
     "noImplicitReturns": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.ts", "src/**/*.ts"],
+  "include": ["index.ts", "secret-contract-api.ts", "src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

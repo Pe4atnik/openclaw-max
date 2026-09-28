@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  # На форке работа идёт в ветках, а не в main: без этого проверки на пуш
+  # не запускались бы вовсе и красное приезжало бы только с открытием PR.
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.16.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Run repository checks
+        run: npm run check
+
+  runtime-compatibility:
+    name: OpenClaw host (${{ matrix.openclaw }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        openclaw: [latest, beta]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Ядро с 2026.9.3 требует Node 24.16+; на более старом npm молча пропускает
+      # установку, и проверка типов не находит SDK вовсе.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.16.0
+          cache: npm
+
+      - name: Install plugin dependencies
+        run: npm ci
+
+      # Ядро — необязательный peer, `npm ci` его не ставит. Ставим без правки
+      # lock-файла и через --save-dev: npm 11 вычищает пакеты, поставленные
+      # с --no-save.
+      - name: Install OpenClaw host
+        run: npm install --save-dev --package-lock=false "openclaw@${{ matrix.openclaw }}"
+
+      - name: Typecheck against the host SDK
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build

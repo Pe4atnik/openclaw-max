@@ -87,7 +87,7 @@ Should show: `MAX default: enabled, dm:allowlist, allow:YOUR_USER_ID`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `token` | string | required | MAX Bot API token |
+| `token` | string \| SecretRef | required | MAX Bot API token, plain or a SecretRef (see below) |
 | `enabled` | boolean | `true` | Enable/disable channel |
 | `dmPolicy` | string | `"allowlist"` | DM access policy: `open`, `allowlist`, `closed` |
 | `allowFrom` | string[] | `[]` | MAX user IDs allowed to DM (when dmPolicy=allowlist) |
@@ -96,6 +96,53 @@ Should show: `MAX default: enabled, dm:allowlist, allow:YOUR_USER_ID`
 | `webhookUrl` | string | — | Webhook URL (optional, uses long polling if not set) |
 | `webhookSecret` | string | — | Webhook secret for request verification |
 | `httpProxy` | string | — | Optional HTTP(S) proxy for MAX API traffic, e.g. `http://user:pass@host:port` |
+
+### Token as a SecretRef
+
+A plain string token keeps working. To keep the credential out of the config file,
+`token` (at the channel level or in `accounts.<id>`) can instead be a
+[SecretRef](https://docs.openclaw.ai/gateway/config-secrets-env) that the gateway
+resolves at startup. Any secret source works; the plugin does not depend on a
+particular store.
+
+From an environment variable — works everywhere, no provider setup needed:
+
+```json5
+{
+  channels: {
+    max: {
+      token: { source: "env", provider: "default", id: "MAX_BOT_TOKEN" },
+    },
+  },
+}
+```
+
+From a file (for example a Docker or Kubernetes secret mounted into the container):
+
+```json5
+{
+  secrets: {
+    providers: {
+      maxfile: { source: "file", path: "/run/secrets/max-token", mode: "singleValue" },
+    },
+  },
+  channels: {
+    max: {
+      token: { source: "file", provider: "maxfile", id: "value" },
+    },
+  },
+}
+```
+
+From an external secret manager (Vault, a system keychain, a password manager) through
+an `exec` provider: declare a resolver under `secrets.providers` and point the ref at
+it, e.g. `{ source: "exec", provider: "vault", id: "max/bot-token" }`. The resolver
+speaks OpenClaw's exec protocol — see the
+[secret providers](https://docs.openclaw.ai/gateway/config-secrets-env) docs.
+
+If a reference cannot be resolved, the gateway marks the account unavailable and the
+plugin does not start it; the log names the unresolved reference. Check with
+`openclaw secrets audit`.
 
 ## MAX API migration (July 2026)
 
@@ -121,6 +168,12 @@ resolver (canonical keys) instead of a flat `max:<senderId>`.
 > session history that one time. This is expected, not a bug.
 
 ## Webhook mode (optional)
+
+Long polling processes updates in order and retries a failed update up to three
+times before leaving the batch marker unchanged. A later poll can therefore
+redeliver the batch. This favors no loss, but an update completed before the
+failure can be delivered more than once; handlers should remain idempotent where
+possible.
 
 For production, configure a webhook instead of long polling:
 
