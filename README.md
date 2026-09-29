@@ -5,13 +5,20 @@ MAX messenger (max.ru) channel plugin for [OpenClaw](https://github.com/openclaw
 ## Features
 
 - DM and group chat support
-- Long polling (default) and webhook modes
+- Resilient long polling (default) and webhook modes: updates are processed in
+  order and retried on transient failures, so a dropped connection does not lose
+  messages
 - Live status updates (Telegram-style): a placeholder reply that shows work in
   progress — thinking, per-tool activity, approval waits — and is cleaned up on
   silent replies
+- Media and voice delivery in agent replies (images and audio), sent alongside
+  the answer without dropping the text — the turn is drafted the same way as the
+  Telegram channel
 - Forwarded messages: incoming forwards are unwrapped and passed to the agent
 - Media sending and receiving (images), including screenshots and images from
   forwarded messages, saved to `~/.openclaw/media/inbound`
+- Bot token as a plain string or a [SecretRef](#token-as-a-secretref) (env, file,
+  or external secret manager) — the credential can stay out of the config file
 - Allowlist-based access control
 
 ## Installation
