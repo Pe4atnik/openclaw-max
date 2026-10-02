@@ -29,6 +29,7 @@ import {
 import { getMaxRuntime } from "./runtime.js";
 import { createWebhookHandler, handleUpdate } from "./webhook-handler.js";
 import type { InboundDelivery, InboundImage, ResolvedMaxAccount } from "./types.js";
+import { isAbortError, isRetryableError, retryWithBackoff, runResilientPolling } from "./reconnect.js";
 
 const CHANNEL_ID = "max";
 
@@ -661,6 +662,16 @@ export async function deliverMessage(
     CHANNEL_ID
   ] as MaxStreamingEntry;
   const streamMode = resolveChannelPreviewStreamMode(entry, "progress") as MaxProgressDraftMode;
+  const mediaReadFile = async (filePath: string): Promise<Buffer> =>
+    Buffer.from(
+      (
+        await rt.media.loadWebMedia(filePath, {
+          // Reply media was authorized by the core turn that produced it;
+          // keep the read itself inside OpenClaw's media runtime.
+          localRoots: "any",
+        })
+      ).buffer,
+    );
   const { onPartialToken, onWorkStart, onThinking, onToolStart, onItemEvent, onApprovalEvent, deliver, finish } =
     createStreamingDeliver(
       account,
@@ -671,6 +682,7 @@ export async function deliverMessage(
       streamMode,
       `${chatId}:${_messageId}`,
       log,
+      mediaReadFile,
     );
 
   try {
@@ -956,11 +968,17 @@ export function createMaxPlugin(): any {
           log?.info?.(`[openclaw-max] Using HTTP proxy for MAX API traffic`);
         }
 
-        // Verify token on startup
         try {
-          const info = await getBotInfo(account.token);
+          const info = await retryWithBackoff(() => getBotInfo(account.token, ctx.abortSignal), {
+            signal: ctx.abortSignal,
+            isRetryable: isRetryableError,
+            onRetry: (_err, attempt, delayMs) => log?.warn?.(
+              `[openclaw-max] Connection lost during token verification; retry ${attempt} in ${delayMs}ms`,
+            ),
+          });
           log?.info?.(`[openclaw-max] Connected as bot: ${info.name} (@${info.username})`);
         } catch (err) {
+          if (ctx.abortSignal?.aborted || isAbortError(err)) return;
           log?.error?.(`[openclaw-max] Token verification failed: ${err instanceof Error ? err.message : err}`);
           return waitUntilAbort(ctx.abortSignal);
         }
@@ -1064,56 +1082,58 @@ async function startWebhookMode(ctx: any, account: ResolvedMaxAccount, _cfg: unk
 
 // ─── Long polling mode ────────────────────────────────────────────────────────
 
-async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg: unknown, log: any) {
+async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, cfg: unknown, log: any) {
   log?.info?.(`[openclaw-max] Starting in long polling mode`);
-
   const signal: AbortSignal = ctx.abortSignal;
   let marker: number | null | undefined = undefined;
-  let consecutiveErrors = 0;
-  const MAX_ERRORS = 5;
+  const updateRetryAttempts = 3;
 
-  while (!signal?.aborted) {
-    try {
-      const result = await getUpdates(account.token, marker, 30, signal);
-      consecutiveErrors = 0;
-
+  await runResilientPolling({
+    signal,
+    isRetryable: isRetryableError,
+    poll: () => getUpdates(account.token, marker, 30, signal),
+    onResult: async (result) => {
       if (result.updates.length > 0) {
         log?.info?.(`[openclaw-max] Received ${result.updates.length} update(s)`);
-        const currentCfg = _cfg;
-
-        for (const update of result.updates) {
-          await handleUpdate(
-            update,
-            account,
-            async (msg: InboundDelivery) => {
-              await deliverMessage(msg, account, currentCfg, log);
-              return null;
+      }
+      for (const update of result.updates ?? []) {
+        if (signal?.aborted) return;
+        try {
+          await retryWithBackoff(
+            () => handleUpdate(
+              update,
+              account,
+              async (msg: InboundDelivery) => {
+                await deliverMessage(msg, account, cfg, log);
+                return null;
+              },
+              log,
+            ),
+            {
+            signal,
+            maxAttempts: updateRetryAttempts,
+            isRetryable: () => true,
+            baseDelayMs: 250,
+            maxDelayMs: 2_000,
+              onRetry: (error, attempt, delayMs) => log?.warn?.(
+                `[openclaw-max] MAX update processing failed; retry ${attempt}/${updateRetryAttempts - 1} in ${delayMs}ms: ${String(error)}`,
+              ),
             },
-            log,
           );
+        } catch (error) {
+          if (signal?.aborted) return;
+          log?.error?.(
+            `[openclaw-max] Failed to process MAX update after ${updateRetryAttempts} attempts; marker not advanced: ${String(error)}`,
+          );
+          throw error;
         }
       }
-
-      // Advance marker
-      if (result.marker != null) {
-        marker = result.marker;
-      }
-    } catch (err) {
-      if (signal?.aborted) break;
-      consecutiveErrors++;
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log?.warn?.(`[openclaw-max] Long polling error (${consecutiveErrors}/${MAX_ERRORS}): ${errMsg}`);
-
-      if (consecutiveErrors >= MAX_ERRORS) {
-        log?.error?.(`[openclaw-max] Too many consecutive errors, stopping long polling`);
-        break;
-      }
-
-      // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-      const delay = Math.min(1000 * Math.pow(2, consecutiveErrors - 1), 30_000);
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-
+      // Commit only after the complete batch succeeds. On exhaustion, MAX can
+      // redeliver it; already completed updates may therefore be duplicated.
+      if (result.marker != null) marker = result.marker;
+    },
+    onConnectionLost: () => log?.warn?.(`[openclaw-max] MAX connection lost; retrying long polling`),
+    onConnectionRestored: () => log?.info?.(`[openclaw-max] MAX connection restored`),
+  });
   log?.info?.(`[openclaw-max] Long polling stopped for account ${account.accountId}`);
 }

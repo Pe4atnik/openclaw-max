@@ -100,13 +100,13 @@ describe("resolveAccount", () => {
 });
 
 describe("токен-ссылка (SecretRef)", () => {
-  const ref = { source: "exec", provider: "openclaw-keychain", id: "max-bot-token" };
+  const ref = { source: "exec", provider: "vault", id: "max/bot-token" };
 
   it("неразрешённая ссылка не роняет разбор: токен пуст, причина названа", () => {
     const account = resolveAccount({ channels: { max: { token: ref } } });
     expect(account.token).toBe("");
-    expect(account.tokenUnresolved).toBe("exec:openclaw-keychain:max-bot-token");
-    expect(describeMissingToken(account)).toContain("SecretRef exec:openclaw-keychain:max-bot-token is not resolved");
+    expect(account.tokenUnresolved).toBe("exec:vault:max/bot-token");
+    expect(describeMissingToken(account)).toContain("SecretRef exec:vault:max/bot-token is not resolved");
   });
 
   it("учётка со ссылкой остаётся в списке — ядро покажет её недоступной, а не потеряет", () => {
@@ -118,7 +118,7 @@ describe("токен-ссылка (SecretRef)", () => {
       { channels: { max: { token: "root", accounts: { work: { token: ref } } } } },
       "work",
     );
-    expect(account.tokenUnresolved).toBe("exec:openclaw-keychain:max-bot-token");
+    expect(account.tokenUnresolved).toBe("exec:vault:max/bot-token");
   });
 
   it("разрешённая ядром ссылка приходит строкой и обрезается как обычно", () => {

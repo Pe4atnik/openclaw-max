@@ -70,7 +70,7 @@ describe.skipIf(!core)("SecretRef на настоящем ядре", () => {
     const schema = createMaxPlugin().configSchema;
     const ok = (token: unknown) => schema.runtime.safeParse({ token }).success;
     expect(ok("plain")).toBe(true);
-    expect(ok({ source: "exec", provider: "openclaw-keychain", id: "max-bot-token" })).toBe(true);
+    expect(ok({ source: "exec", provider: "vault", id: "max/bot-token" })).toBe(true);
     expect(ok({ source: "env", provider: "default", id: "MAX_TOKEN" })).toBe(true);
     expect(ok({ source: "exec" })).toBe(false);
     expect(ok({ source: "env", provider: "default", id: "lowercase" })).toBe(false);
@@ -85,7 +85,7 @@ describe.skipIf(!core)("SecretRef на настоящем ядре", () => {
     const ajv = new Ajv({ strict: false });
     const channelSchema = ajv.compile(manifest.channelConfigs.max.schema);
     const pluginSchema = ajv.compile(manifest.configSchema);
-    const ref = { source: "exec", provider: "openclaw-keychain", id: "max-bot-token" };
+    const ref = { source: "exec", provider: "vault", id: "max/bot-token" };
 
     for (const token of ["plain", ref, { source: "env", provider: "default", id: "MAX_TOKEN" }]) {
       expect(channelSchema({ token })).toBe(true);

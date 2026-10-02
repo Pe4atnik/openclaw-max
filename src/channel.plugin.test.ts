@@ -473,7 +473,7 @@ describe("запуск канала", () => {
   });
 
   it("неразрешённая ссылка на токен: внятная ошибка, в API не ходим", async () => {
-    const ref = { source: "exec", provider: "openclaw-keychain", id: "max-bot-token" };
+    const ref = { source: "exec", provider: "vault", id: "max/bot-token" };
     const ctl = abortable();
     const started = plugin.gateway.startAccount({
       cfg: { channels: { max: { token: ref } } },
@@ -484,7 +484,7 @@ describe("запуск канала", () => {
     ctl.abort();
     await started;
 
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("SecretRef exec:openclaw-keychain:max-bot-token is not resolved"));
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("SecretRef exec:vault:max/bot-token is not resolved"));
     expect(client.getBotInfo).not.toHaveBeenCalled();
     expect(client.configureMaxTransport).not.toHaveBeenCalled();
 
@@ -512,6 +512,44 @@ describe("запуск канала", () => {
 
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining("Token verification failed"));
     expect(client.getUpdates).not.toHaveBeenCalled();
+  });
+
+  it("передаёт lifecycle signal в активную проверку токена и быстро останавливается", async () => {
+    const ctl = abortable();
+    client.getBotInfo.mockImplementationOnce(async (_token: string, signal: AbortSignal) => {
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.waitFor(() => expect(client.getBotInfo).toHaveBeenCalledWith("tok", ctl.signal));
+    ctl.abort();
+    await started;
+
+    expect(client.getBotInfo).toHaveBeenCalledTimes(1);
+    expect(client.getUpdates).not.toHaveBeenCalled();
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("Connection lost during token verification"));
+  });
+
+  it("временный сбой проверки токена повторяется и затем подключается", async () => {
+    vi.useFakeTimers();
+    client.getBotInfo
+      .mockRejectedValueOnce(Object.assign(new Error("temporary"), { status: 503 }))
+      .mockResolvedValueOnce({ name: "бот", username: "bot" });
+    const ctl = abortable();
+    client.getUpdates.mockImplementation(async () => {
+      ctl.abort();
+      return { updates: [], marker: null };
+    });
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await started;
+
+    expect(client.getBotInfo).toHaveBeenCalledTimes(2);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("Connection lost during token verification"));
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("Connected as bot"));
   });
 
   it("с прокси транспорт настраивается до первого вызова", async () => {
@@ -574,12 +612,19 @@ describe("запуск канала", () => {
   it("без webhookUrl идёт длинный опрос и обновления уходят обработчику", async () => {
     client.getBotInfo.mockResolvedValueOnce({ name: "бот", username: "bot" });
     const ctl = abortable();
-    client.getUpdates.mockImplementation(async () => {
-      ctl.abort();
-      return { updates: [{ update_type: "message_created" }], marker: 11 };
-    });
+    client.getUpdates
+      .mockResolvedValueOnce({ updates: [{ update_type: "message_created" }], marker: 11 })
+      .mockImplementationOnce(async () => {
+        if (!ctl.signal.aborted) {
+          await new Promise<void>((resolve) => ctl.signal.addEventListener("abort", () => resolve(), { once: true }));
+        }
+        return { updates: [], marker: 11 };
+      });
 
-    await plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.waitFor(() => expect(handleUpdate).toHaveBeenCalledOnce());
+    ctl.abort();
+    await started;
 
     expect(client.getUpdates).toHaveBeenCalled();
     expect(handleUpdate).toHaveBeenCalledWith(

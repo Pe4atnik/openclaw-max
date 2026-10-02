@@ -90,6 +90,7 @@ async function maxRequest<T>(
   path: string,
   params?: Record<string, string | number>,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<T> {
   const url = new URL(`${MAX_API}${path}`);
   if (params) {
@@ -105,29 +106,27 @@ async function maxRequest<T>(
     headers["Content-Type"] = "application/json";
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const requestSignal = AbortSignal.any([
+    AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    ...(signal ? [signal] : []),
+  ]);
 
-  try {
-    const res = await fetch(url.toString(), {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-      dispatcher,
-    });
+  const res = await fetch(url.toString(), {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: requestSignal,
+    dispatcher,
+  });
 
-    const text = await res.text();
-    if (!res.ok) {
-      throw new MaxApiError(
-        `MAX API ${method} ${path} → ${res.status}: ${safeResponseSummary(text)}`,
-        res.status,
-      );
-    }
-    return JSON.parse(text) as T;
-  } finally {
-    clearTimeout(timer);
+  const text = await res.text();
+  if (!res.ok) {
+    throw new MaxApiError(
+      `MAX API ${method} ${path} → ${res.status}: ${safeResponseSummary(text)}`,
+      res.status,
+    );
   }
+  return JSON.parse(text) as T;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -295,8 +294,8 @@ export async function deleteWebhook(token: string): Promise<void> {
 /**
  * Get bot info (used to verify token on startup).
  */
-export async function getBotInfo(token: string): Promise<{ name: string; username: string }> {
-  return maxRequest(token, "GET", "/me");
+export async function getBotInfo(token: string, signal?: AbortSignal): Promise<{ name: string; username: string }> {
+  return maxRequest(token, "GET", "/me", undefined, undefined, signal);
 }
 
 /**

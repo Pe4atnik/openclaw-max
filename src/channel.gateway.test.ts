@@ -71,9 +71,11 @@ vi.mock("./progress-draft.js", () => ({
   resolveMaxProgressLabel: () => "⏳ Работаю",
 }));
 
+const loadWebMedia = vi.fn();
 const dispatch = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock("./runtime.js", () => ({
   getMaxRuntime: () => ({
+    media: { loadWebMedia: (...args: unknown[]) => loadWebMedia(...args) },
     channel: {
       routing: { resolveAgentRoute: () => ({ sessionKey: "agent:main:max:direct:42" }) },
       reply: {
@@ -119,6 +121,7 @@ beforeEach(() => {
   client.sendTypingAction.mockResolvedValue(undefined);
   client.markSeen.mockResolvedValue(undefined);
   client.getBotInfo.mockResolvedValue({ name: "бот", username: "bot" });
+  loadWebMedia.mockResolvedValue({ buffer: Buffer.from("media") });
 });
 
 afterEach(() => {
@@ -144,6 +147,77 @@ describe("вебхук", () => {
     expect(dispatch).toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      label: "картинку",
+      mediaUrl: "https://media.test/agent-reply.png",
+      setup: () => {
+        client.getUploadUrl.mockResolvedValue("https://upload.test/image");
+        client.uploadFile.mockResolvedValue({ token: "image-token" });
+        client.sendDmWithImage.mockResolvedValue("mid-image");
+      },
+      assertSent: () => {
+        expect(client.uploadFile).toHaveBeenCalledWith(
+          "https://upload.test/image",
+          Buffer.from("media"),
+          "image/png",
+          "agent-reply.png",
+        );
+        expect(client.sendDmWithImage).toHaveBeenCalledWith("tok", 42, "", "image-token");
+      },
+    },
+    {
+      label: "голосовой ответ",
+      mediaUrl: "https://media.test/agent-reply.ogg",
+      setup: () => {
+        client.createUpload.mockResolvedValue({
+          url: "https://upload.test/audio",
+          token: "audio-token",
+        });
+        client.uploadToUrl.mockResolvedValue({ token: "audio-token" });
+        client.sendWithAttachment.mockResolvedValue("mid-audio");
+      },
+      assertSent: () => {
+        expect(client.uploadToUrl).toHaveBeenCalledWith(
+          "https://upload.test/audio",
+          Buffer.from("media"),
+          "audio/ogg",
+          "agent-reply.ogg",
+        );
+        expect(client.sendWithAttachment).toHaveBeenCalledWith(
+          "tok",
+          { kind: "direct", id: 42 },
+          "",
+          { type: "audio", payload: { token: "audio-token" } },
+        );
+      },
+    },
+  ])(
+    "ответ агента читает и отправляет $label через runtime OpenClaw",
+    async ({ mediaUrl, setup, assertSent }) => {
+      setup();
+      dispatch.mockImplementationOnce(async (params: any) => {
+        await params.dispatcherOptions.deliver({ text: "", mediaUrl }, { kind: "final" });
+      });
+
+      const ctl = new AbortController();
+      const started = plugin.gateway.startAccount({
+        cfg,
+        accountId: "default",
+        log,
+        abortSignal: ctl.signal,
+      });
+      ctl.abort();
+      await started;
+
+      const deliver = webhookHandlerParams[0]?.deliver as (msg: unknown) => Promise<unknown>;
+      await expect(deliver(inbound)).resolves.toBeNull();
+
+      expect(loadWebMedia).toHaveBeenCalledWith(mediaUrl, { localRoots: "any" });
+      assertSent();
+    },
+  );
+
   it("повторный запуск снимает устаревший маршрут", async () => {
     // Второй запуск ДО остановки первого: именно так выглядит перезагрузка
     // настроек, и без снятия старого маршрута их осталось бы два.
@@ -154,8 +228,7 @@ describe("вебхук", () => {
       log,
       abortSignal: first.signal,
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(registerPluginHttpRoute).toHaveBeenCalledTimes(1));
 
     const second = new AbortController();
     const secondStarted = plugin.gateway.startAccount({
@@ -164,8 +237,7 @@ describe("вебхук", () => {
       log,
       abortSignal: second.signal,
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(registerPluginHttpRoute).toHaveBeenCalledTimes(2));
 
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining("Deregistering stale"));
     expect(unregisterRoute).toHaveBeenCalled();
@@ -261,16 +333,84 @@ describe("длинный опрос", () => {
 
   it("обновление уходит обработчику, и тот прогоняет ход", async () => {
     const ctl = new AbortController();
-    client.getUpdates.mockImplementation(async () => {
-      ctl.abort();
-      return { updates: [{ update_type: "message_created" }], marker: 3 };
-    });
+    client.getUpdates
+      .mockResolvedValueOnce({ updates: [{ update_type: "message_created" }], marker: 3 })
+      .mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => ctl.signal.addEventListener("abort", () => resolve(), { once: true }));
+        return { updates: [], marker: 3 };
+      });
 
-    await plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.waitFor(() => expect(handleUpdate).toHaveBeenCalledOnce());
 
     const deliver = handleUpdate.mock.calls[0]?.[2] as (msg: unknown) => Promise<unknown>;
     await expect(deliver(inbound)).resolves.toBeNull();
     expect(dispatch).toHaveBeenCalled();
+    ctl.abort();
+    await started;
+  });
+
+  it("повторяет сбойный update до успеха, сохраняет порядок и только потом двигает marker", async () => {
+    vi.useFakeTimers();
+    const ctl = new AbortController();
+    const first = { update_type: "message_created", message: { body: { mid: "first" } } };
+    const second = { update_type: "message_created", message: { body: { mid: "second" } } };
+    client.getUpdates
+      .mockResolvedValueOnce({ updates: [first, second], marker: 4 })
+      .mockImplementationOnce(async (_token: string, marker: number | null | undefined) => {
+        expect(marker).toBe(4);
+        ctl.abort();
+        return { updates: [], marker: 4 };
+      });
+    handleUpdate
+      .mockRejectedValueOnce(new TypeError("transient handler bug"))
+      .mockResolvedValue(undefined);
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await started;
+
+    expect(handleUpdate.mock.calls.map((call) => call[0])).toEqual([first, first, second]);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("MAX update processing failed; retry 1/2"));
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("MAX connection lost"));
+  });
+
+  it("не двигает marker и не обгоняет update после исчерпания попыток", async () => {
+    vi.useFakeTimers();
+    const ctl = new AbortController();
+    const first = { update_type: "message_created", message: { body: { mid: "first" } } };
+    const second = { update_type: "message_created", message: { body: { mid: "second" } } };
+    client.getUpdates.mockResolvedValueOnce({ updates: [first, second], marker: 7 });
+    handleUpdate.mockRejectedValue(new TypeError("persistent handler bug"));
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    const rejected = expect(started).rejects.toThrow("persistent handler bug");
+    await vi.advanceTimersByTimeAsync(2_000);
+    await rejected;
+
+    expect(handleUpdate).toHaveBeenCalledTimes(3);
+    expect(handleUpdate.mock.calls.every((call) => call[0] === first)).toBe(true);
+    expect(client.getUpdates).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("marker not advanced"));
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("MAX connection lost"));
+  });
+
+  it("abort останавливает retry update без marker advance", async () => {
+    vi.useFakeTimers();
+    const ctl = new AbortController();
+    const update = { update_type: "message_created", message: { body: { mid: "abort" } } };
+    client.getUpdates.mockResolvedValueOnce({ updates: [update], marker: 9 });
+    handleUpdate.mockRejectedValue(new TypeError("handler bug"));
+
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.waitFor(() => expect(handleUpdate).toHaveBeenCalledOnce());
+    ctl.abort();
+    await vi.runAllTimersAsync();
+    await started;
+
+    expect(handleUpdate).toHaveBeenCalledTimes(1);
+    expect(client.getUpdates).toHaveBeenCalledTimes(1);
+    expect(log.error).not.toHaveBeenCalledWith(expect.stringContaining("marker not advanced"));
   });
 
   it("ошибка опроса считается и ход повторяется после паузы", async () => {
@@ -279,7 +419,7 @@ describe("длинный опрос", () => {
     let calls = 0;
     client.getUpdates.mockImplementation(async () => {
       calls += 1;
-      if (calls === 1) throw new Error("network down");
+      if (calls === 1) throw new TypeError("network down");
       ctl.abort();
       return { updates: [], marker: null };
     });
@@ -293,27 +433,27 @@ describe("длинный опрос", () => {
     await vi.advanceTimersByTimeAsync(5000);
     await started;
 
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("Long polling error (1/"));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("MAX connection lost"));
     expect(calls).toBeGreaterThanOrEqual(2);
   });
 
-  it("после череды ошибок опрос останавливается", async () => {
+  it("после череды ошибок опрос продолжает попытки и восстанавливается", async () => {
     vi.useFakeTimers();
     const ctl = new AbortController();
-    client.getUpdates.mockRejectedValue(new Error("network down"));
-
-    const started = plugin.gateway.startAccount({
-      cfg,
-      accountId: "default",
-      log,
-      abortSignal: ctl.signal,
+    let calls = 0;
+    client.getUpdates.mockImplementation(async () => {
+      calls += 1;
+      if (calls <= 6) throw new TypeError("network down");
+      ctl.abort();
+      return { updates: [], marker: null };
     });
-    await vi.advanceTimersByTimeAsync(120_000);
-    await started;
 
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining("Too many consecutive errors"));
+    const started = plugin.gateway.startAccount({ cfg, accountId: "default", log, abortSignal: ctl.signal });
+    await vi.runAllTimersAsync();
+
+    await expect(started).resolves.toBeUndefined();
+    expect(client.getUpdates).toHaveBeenCalledTimes(7);
   });
-
   it("прерывание во время ошибки не считается сбоем", async () => {
     const ctl = new AbortController();
     client.getUpdates.mockImplementation(async () => {
